@@ -150,6 +150,9 @@ input[type=number]{width:80px}select{width:100%;margin-bottom:4px}
 button{background:#333;color:#eee;border:0;border-radius:6px;padding:8px 14px;font:inherit}
 button.on{background:#4a9;color:#000}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
+canvas{width:100%;height:150px;display:block;background:#1c1c1c;border-radius:8px}
+.leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
+.leg i{font-style:normal}
 </style>
 <h1>Haze Regulator</h1>
 <div class=g>
@@ -163,6 +166,9 @@ button.on{background:#4a9;color:#000}
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
+<canvas id=chart></canvas>
+<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze output %</i>
+<i style=color:#888>setpoint</i><i id=span></i></div>
 <button id=mode onclick="post('automatic',this.dataset.v==1?0:1)">-</button>
 <label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)">
 <label>Setpoint PM2.5 <span id=vsp></span></label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
@@ -179,6 +185,32 @@ let touching=0;
 document.querySelectorAll('input[type=range]').forEach(e=>{
   e.onpointerdown=()=>touching=1; e.onpointerup=()=>touching=0;});
 function post(k,v){fetch('/api/set?'+k+'='+v)}
+const hist=[];
+function draw(){
+  const c=chart,ctx=c.getContext('2d'),dpr=devicePixelRatio||1;
+  const w=c.clientWidth,h=150;
+  c.width=w*dpr;c.height=h*dpr;ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,w,h);
+  if(hist.length<2)return;
+  const sp=hist[hist.length-1].sp;
+  // Scale to whichever is larger, the setpoint or the worst reading, so the
+  // setpoint line stays on screen even when the sensor pegs.
+  const top=Math.max(20,sp*1.3,...hist.map(p=>p.pm))*1.05;
+  const X=i=>i*(w-1)/(hist.length-1);
+  const line=(key,max,col,lw)=>{
+    ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
+    hist.forEach((p,i)=>{const y=h-2-p[key]/max*(h-4);
+      i?ctx.lineTo(X(i),y):ctx.moveTo(X(i),y)});
+    ctx.stroke();};
+  ctx.strokeStyle='#555';ctx.setLineDash([4,4]);ctx.lineWidth=1;ctx.beginPath();
+  const spy=h-2-sp/top*(h-4);ctx.moveTo(0,spy);ctx.lineTo(w,spy);ctx.stroke();
+  ctx.setLineDash([]);
+  line('out',100,'#e94',1.5);
+  line('pm',top,'#4a9',2);
+  ctx.fillStyle='#666';ctx.font='10px system-ui';
+  ctx.fillText(Math.round(top)+' ug/m3',4,11);
+}
+addEventListener('resize',draw);
 async function tick(){
   let s=await(await fetch('/api/state')).json();
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
@@ -198,6 +230,10 @@ async function tick(){
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
+  hist.push({pm:s.pm25,out:s.output,sp:s.setpoint});
+  if(hist.length>600)hist.shift();
+  span.textContent=hist.length<60?hist.length+'s':Math.round(hist.length/60)+' min';
+  draw();
 }
 tick();setInterval(tick,1000);
 </script>)HTML";
