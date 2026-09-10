@@ -238,7 +238,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze output %</i>
 <i style=color:#888>setpoint</i><i id=span></i></div>
 <select id=win onchange="setWin(this.value)">
-<option value=60>1 minute</option><option value=300>5 minutes</option>
+<option value=30>30 seconds</option><option value=60>1 minute</option><option value=300>5 minutes</option>
 <option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
