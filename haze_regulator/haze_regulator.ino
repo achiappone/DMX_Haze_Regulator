@@ -71,14 +71,14 @@ unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // Calibration measures the three numbers that are properties of the room, not
 // the equipment: how long haze takes to arrive, how fast it accumulates at full
 // output, and how slowly it clears. Guessing these is what causes overshoot.
-enum { CAL_OFF = 0, CAL_SETTLE, CAL_PULSE, CAL_DECAY, CAL_DONE, CAL_FAIL };
+enum { CAL_OFF = 0, CAL_PURGE, CAL_SETTLE, CAL_PULSE, CAL_DECAY, CAL_DONE, CAL_FAIL };
 #define CAL_SETTLE_S 10
 int calState = CAL_OFF;
 unsigned long calT0 = 0, calPeakT = 0;
 int calBaseline = 0, calPeak = 0, calDead = 0, calTau = 0, calPulseUsed = 0;
 float calRise = 0;
 char calMsg[72] = "";
-bool calibrating() { return calState >= CAL_SETTLE && calState <= CAL_DECAY; }
+bool calibrating() { return calState >= CAL_PURGE && calState <= CAL_DECAY; }
 
 uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
@@ -182,6 +182,21 @@ void runCalibration(unsigned long now, int pm) {
   unsigned long el = (now - calT0) / 1000;
   int trig = calBaseline + max(10, calBaseline / 6);  // clear of sensor noise
   switch (calState) {
+    case CAL_PURGE:
+      // Clear the room first. Measuring from a hazy baseline squeezes the
+      // excursion against the sensor ceiling and gives a useless rise rate.
+      target = output = 0;
+      purgeUntil = now + 2000;  // rolling, so the fan stays open via purge
+      if (pm < 60 || (el > 60 && pmSlope > -0.3f) || el > 900) {
+        purgeUntil = 0;
+        if (pm > 700) {
+          calFail("room too hazy to calibrate - clear it and retry");
+          break;
+        }
+        calT0 = now;
+        calState = CAL_SETTLE;
+      }
+      break;
     case CAL_SETTLE:
       target = output = 0;
       if (el >= CAL_SETTLE_S) {
@@ -394,7 +409,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
 <details><summary>Tuning</summary>
-<div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<4?0:1)">Calibrate</button>
+<div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<5?0:1)">Calibrate</button>
 <select id=calpulse onchange="post('calpulse',this.value)">
 <option value=30>30s pulse</option><option value=60>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option>
@@ -514,12 +529,12 @@ async function tick(){
   pulsestat.textContent=s.pulse?(s.output>0&&s.output<100?
     on.toFixed(1)+'s on / '+(s.pperiod-on).toFixed(1)+'s off':
     (s.output?'continuous':'off')):'';
-  cal.textContent=s.cal&&s.cal<4?'Cancel':'Calibrate';
-  cal.className=s.cal&&s.cal<4?'on':'';
+  cal.textContent=s.cal&&s.cal<5?'Cancel':'Calibrate';
+  cal.className=s.cal&&s.cal<5?'on':'';
   if(document.activeElement!=calpulse)calpulse.value=s.calpulse;
   const lt=s.calleft?' ('+s.calleft+'s)':'';
-  calstat.textContent=['','settling'+lt,'pulsing 100%'+lt,'watching decay...',
-    s.calmsg,'failed: '+s.calmsg][s.cal]||'';
+  calstat.textContent=['','purging the room...','settling'+lt,'pulsing 100%'+lt,
+    'watching decay...',s.calmsg,'failed: '+s.calmsg][s.cal]||'';
   stopped=s.stopped;
   // NB: id must not be "stop" - window.stop() already owns that name, so the
   // element never shadows it and every property access here throws.
@@ -603,9 +618,9 @@ void handleSet() {
     cfg.pulsePeriod = constrain(server.arg("pperiod").toInt(), 5, 60);
   if (server.hasArg("calibrate")) {
     if (server.arg("calibrate").toInt()) {
-      calState = CAL_SETTLE; calT0 = millis(); calMsg[0] = 0;
+      calState = CAL_PURGE; calT0 = millis(); calMsg[0] = 0;
     } else {
-      calState = CAL_OFF; calMsg[0] = 0;
+      calState = CAL_OFF; calMsg[0] = 0; purgeUntil = 0;
     }
   }
   if (server.hasArg("purge")) {
@@ -705,6 +720,7 @@ void loop() {
   if (now - lastControl >= 1000) {
     lastControl = now;
     if (cfg.stopped) {
+      if (calibrating()) purgeUntil = 0;
       calState = CAL_OFF;
       // Latched, and snaps rather than slewing. The fan is deliberately left
       // alone: it makes no haze, and running it helps clear what is already up.
