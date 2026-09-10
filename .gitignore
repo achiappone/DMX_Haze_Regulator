@@ -1,0 +1,3 @@
+# WiFi credentials - copy secrets.h.example to secrets.h and fill in
+haze_regulator/secrets.h
+build/
