@@ -317,7 +317,11 @@ void selfTest() {
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Haze Regulator</title><style>
-body{font:15px system-ui;margin:0 auto;max-width:820px;padding:20px 28px;background:#111;color:#eee}
+html{background:#0a0a0a}
+body{font:15px system-ui;margin:22px auto;max-width:820px;padding:22px 28px;
+background:#141414;color:#eee;border:1px solid #2e2e2e;border-radius:14px;
+box-shadow:0 2px 18px #0008}
+.c{background:#1e1e1e}
 h1{font-size:17px;margin:0 0 12px}
 .g{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px;margin-bottom:14px}
 .c{background:#1c1c1c;border-radius:8px;padding:10px}
