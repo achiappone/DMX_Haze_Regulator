@@ -28,7 +28,6 @@ Adafruit_PM25AQI aqi;
 WebServer server(80);
 uint8_t dmxData[DMX_PACKET_SIZE];
 Preferences prefs;
-#define CFG_VERSION 1
 
 // Channel layout differs per machine. Offsets are from the start address; -1
 // means the fixture has no such channel. Both machines use the same 011-255
@@ -56,6 +55,10 @@ struct {
   int dmxAddress = 1;    // start address; channel layout depends on fixture
   int fixture = 0;       // index into FIXTURES
   int lookahead = 0;     // seconds to extrapolate the PM trend; 0 = off
+  bool stopped = false;  // latched stop; survives reboot on purpose
+  bool pulseMode = false;  // time-proportional output instead of continuous
+  int pulsePeriod = 10;    // seconds per pulse cycle
+  int pulseLevel = 100;    // output % during the on part of the cycle
 } cfg;
 
 PM25_AQI_Data data;
@@ -64,6 +67,19 @@ uint8_t output = 0, target = 0;
 unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0, lastControl = 0;
 unsigned long purgeUntil = 0;
 unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
+// Calibration measures the three numbers that are properties of the room, not
+// the equipment: how long haze takes to arrive, how fast it accumulates at full
+// output, and how slowly it clears. Guessing these is what causes overshoot.
+enum { CAL_OFF = 0, CAL_SETTLE, CAL_PULSE, CAL_DECAY, CAL_DONE, CAL_FAIL };
+#define CAL_SETTLE_S 10
+#define CAL_PULSE_S 15
+int calState = CAL_OFF;
+unsigned long calT0 = 0, calPeakT = 0;
+int calBaseline = 0, calPeak = 0, calDead = 0, calTau = 0;
+float calRise = 0;
+char calMsg[72] = "";
+bool calibrating() { return calState >= CAL_SETTLE && calState <= CAL_DECAY; }
+
 uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
@@ -123,22 +139,119 @@ int predict(int pm, float slopePerSec, int lookaheadSec) {
   return p < 0 ? 0 : (p > 2000 ? 2000 : (int)p);
 }
 
+// Time-proportional output: instead of holding a low continuous level, run the
+// machine at a strong level for a fraction of each cycle. Hazers atomise poorly
+// at low duty, so 20% as 2s-on/8s-off often disperses better than a steady 20%.
+uint8_t dutyLevel(unsigned long ms, int demand, int period, int level) {
+  if (demand <= 0) return 0;
+  if (demand >= 100) return 100;
+  unsigned long per = (unsigned long)period * 1000;
+  return (ms % per) < per * demand / 100 ? (uint8_t)level : 0;
+}
+
 // A fixture occupying n channels cannot start later than 513-n.
 int maxAddress(uint8_t chans) { return DMX_PACKET_SIZE - chans; }
+
+void calFail(const char *m) {
+  snprintf(calMsg, sizeof(calMsg), "%s", m);
+  calState = CAL_FAIL;
+  target = output = 0;
+}
+
+// Ziegler-Nichols for a dead-time process gives Kp = 100/(rise*dead); halved,
+// because this plant is violently asymmetric - haze arrives in seconds and
+// clears over many minutes, so overshoot is far more expensive than droop.
+void calFinish() {
+  if (calDead < 1) calDead = 1;
+  calRise = (float)(calPeak - calBaseline) / CAL_PULSE_S;
+  cfg.lookahead = constrain(calDead, 0, 120);
+  cfg.slew = constrain(100 / calDead, 1, 100);
+  if (calRise > 0.01f)
+    cfg.gain = constrain(50.0f / (calRise * calDead), 0.1f, 10.0f);
+  snprintf(calMsg, sizeof(calMsg),
+           "dead %ds, rise %.1f ug/s, decay %ds -> look %d, slew %d, gain %.1f",
+           calDead, calRise, calTau, cfg.lookahead, cfg.slew, cfg.gain);
+  calState = CAL_DONE;
+  target = output = 0;
+  saveAt = millis() + 500;
+}
+
+void runCalibration(unsigned long now, int pm) {
+  unsigned long el = (now - calT0) / 1000;
+  int trig = calBaseline + max(10, calBaseline / 6);  // clear of sensor noise
+  switch (calState) {
+    case CAL_SETTLE:
+      target = output = 0;
+      if (el >= CAL_SETTLE_S) {
+        calBaseline = pm; calPeak = pm; calDead = 0; calPeakT = 0;
+        calT0 = now; calState = CAL_PULSE;
+      }
+      break;
+    case CAL_PULSE:
+      target = output = 100;
+      if (pm > calPeak) { calPeak = pm; calPeakT = now; }
+      if (!calDead && pm > trig) calDead = el < 1 ? 1 : el;
+      if (el >= CAL_PULSE_S) { calT0 = now; calState = CAL_DECAY; }
+      break;
+    case CAL_DECAY:
+      target = output = 0;
+      if (pm > calPeak) { calPeak = pm; calPeakT = now; }
+      if (!calDead && pm > trig) calDead = CAL_PULSE_S + el;
+      if (!calDead && el > 45) {
+        calFail("no PM rise - machine off, not hazing, or sensor too far");
+        break;
+      }
+      // Decay constant: time from the peak to 37% of the excursion.
+      if (calDead && calPeakT && calPeak > calBaseline + 10 &&
+          pm <= calBaseline + (calPeak - calBaseline) * 37 / 100) {
+        calTau = (now - calPeakT) / 1000;
+        calFinish();
+      } else if (el > 900) {  // still hazy after 15 min; record and move on
+        calTau = 900;
+        calFinish();
+      }
+      break;
+  }
+}
 
 // Settings survive a reboot or a reflash. Losing them silently was actively
 // dangerous: the fixture profile would revert to a 2-channel machine, and Purge
 // would then drive ch1 to full expecting a fan, which a 1DX reads as full haze.
+// One key per setting. A blob keyed on a version number meant that adding any
+// new field invalidated every stored value, which silently reset the fixture
+// profile - the one setting that is genuinely unsafe to get wrong.
 void saveCfg() {
-  prefs.putUInt("ver", CFG_VERSION);
-  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.putBool("auto", cfg.automatic);
+  prefs.putUChar("manual", cfg.manual);
+  prefs.putInt("setpoint", cfg.setpoint);
+  prefs.putInt("deadband", cfg.deadband);
+  prefs.putFloat("gain", cfg.gain);
+  prefs.putInt("slew", cfg.slew);
+  prefs.putInt("fan", cfg.fan);
+  prefs.putInt("addr", cfg.dmxAddress);
+  prefs.putInt("fixture", cfg.fixture);
+  prefs.putInt("look", cfg.lookahead);
+  prefs.putBool("stopped", cfg.stopped);
+  prefs.putBool("pulse", cfg.pulseMode);
+  prefs.putInt("pperiod", cfg.pulsePeriod);
+  prefs.putInt("plevel", cfg.pulseLevel);
 }
 
 void loadCfg() {
-  if (prefs.getUInt("ver", 0) != CFG_VERSION ||
-      prefs.getBytesLength("cfg") != sizeof(cfg))
-    return;  // first boot, or the layout changed - keep compiled defaults
-  prefs.getBytes("cfg", &cfg, sizeof(cfg));
+  cfg.automatic = prefs.getBool("auto", cfg.automatic);
+  cfg.manual = prefs.getUChar("manual", cfg.manual);
+  cfg.setpoint = prefs.getInt("setpoint", cfg.setpoint);
+  cfg.deadband = prefs.getInt("deadband", cfg.deadband);
+  cfg.gain = prefs.getFloat("gain", cfg.gain);
+  cfg.slew = prefs.getInt("slew", cfg.slew);
+  cfg.fan = prefs.getInt("fan", cfg.fan);
+  cfg.dmxAddress = prefs.getInt("addr", cfg.dmxAddress);
+  cfg.fixture = prefs.getInt("fixture", cfg.fixture);
+  cfg.lookahead = prefs.getInt("look", cfg.lookahead);
+  cfg.stopped = prefs.getBool("stopped", cfg.stopped);
+  cfg.pulseMode = prefs.getBool("pulse", cfg.pulseMode);
+  cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
+  cfg.pulseLevel = prefs.getInt("plevel", cfg.pulseLevel);
   // Clamp everything: stored bytes are not trustworthy input.
   cfg.fixture = constrain(cfg.fixture, 0, (int)FIXTURE_COUNT - 1);
   cfg.dmxAddress =
@@ -150,6 +263,8 @@ void loadCfg() {
   cfg.gain = constrain(cfg.gain, 0.1f, 10.0f);
   cfg.slew = constrain(cfg.slew, 1, 100);
   cfg.lookahead = constrain(cfg.lookahead, 0, 120);
+  cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
+  cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
 }
 
 // Proportional with deadband. Pure, so selfTest() can check it.
@@ -191,6 +306,12 @@ void selfTest() {
   assert(predict(100, -2.0f, 30) == 40);     // falling fast, act early
   assert(predict(10, -2.0f, 30) == 0);       // clamps at zero
   assert(predict(100, 0.0f, 30) == 100);     // flat trend changes nothing
+  assert(dutyLevel(0, 20, 10, 100) == 100);      // 20% of 10s: on at t=0
+  assert(dutyLevel(1999, 20, 10, 100) == 100);   // still on just before 2s
+  assert(dutyLevel(2001, 20, 10, 100) == 0);     // off after 2s
+  assert(dutyLevel(9999, 20, 10, 100) == 0);     // off until the cycle repeats
+  assert(dutyLevel(5000, 0, 10, 100) == 0);      // zero demand never fires
+  assert(dutyLevel(5000, 100, 10, 100) == 100);  // full demand is continuous
   Serial.println("selfTest ok");
 }
 
@@ -207,11 +328,14 @@ h1{font-size:17px;margin:0 0 12px}
 label{display:block;margin:10px 0 2px;color:#999;font-size:12px}
 input[type=range]{width:100%}
 input[type=number],select{background:#1c1c1c;color:#eee;border:1px solid #333;border-radius:6px;padding:6px;font:inherit}
-input[type=number]{width:80px}select{width:100%;margin-bottom:4px}
+input[type=number]{width:80px}select{width:auto;max-width:100%;margin-bottom:4px}
 button{background:#333;color:#eee;border:0;border-radius:6px;padding:8px 14px;font:inherit}
 button.on{background:#4a9;color:#000}
+button.stop{background:#c0392b;color:#fff;font-weight:600;letter-spacing:.5px}
+button.stop.armed{background:#e74c3c;box-shadow:0 0 0 2px #e74c3c55}
+#warn.halt{color:#e74c3c;font-weight:600}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
-canvas{width:100%;height:150px;display:block;background:#1c1c1c;border-radius:8px}
+canvas{width:100%;height:300px;display:block;background:#1c1c1c;border-radius:8px}
 #win,#pdur{width:auto;margin:0 0 12px}
 details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
@@ -243,7 +367,8 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
 <option value=86400>24 hours</option><option value=604800>7 days</option></select>
-<div class=row><button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
+<div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
+<button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
 <button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button>
 <select id=pdur><option value=30>30s</option><option value=60 selected>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option></select></div>
@@ -251,19 +376,26 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
 <details><summary>Tuning</summary>
+<div class=row><button id=cal onclick="post('calibrate',s_cal?0:1)">Calibrate</button>
+<i id=calstat style=color:#888;font-size:12px></i></div>
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
 <label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
+<div class=row><button id=pulsebtn onclick="post('pulse',pulseOn?0:1)">Pulse mode</button>
+<i id=pulsestat style=color:#888;font-size:12px></i></div>
+<label>Pulse period <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)">
 <label>Lookahead <span id=vla></span>s <i style=color:#666>(0 = react only)</i></label><input type=range id=lookahead min=0 max=120 oninput="post('lookahead',this.value)">
 </details>
 <details><summary>Setup</summary>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
 <option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
 <option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
-<label>DMX start address</label><input type=number id=dmxaddr min=1 max=511 onchange="post('dmxaddr',this.value)">
+<label>DMX start address</label>
+<div class=row><input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
+<button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 </details>
 <script>
-let touching=0,purging=false;
+let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false;
 document.querySelectorAll('input[type=range]').forEach(e=>{
   e.onpointerdown=()=>touching=1; e.onpointerup=()=>touching=0;});
 // Coalesce changes into one request and refresh straight after, so a button
@@ -299,14 +431,14 @@ function series(){
 }
 function draw(){
   const c=chart,ctx=c.getContext('2d'),dpr=devicePixelRatio||1;
-  const w=c.clientWidth,h=150;
+  const w=c.clientWidth,h=c.clientHeight;
   c.width=w*dpr;c.height=h*dpr;ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,w,h);
   const t1=Date.now(),t0=t1-winSec*1000;
   let pts=series().filter(p=>p.t>=t0);
   const step=Math.max(1,Math.ceil(pts.length/(w*2)));
   if(step>1)pts=pts.filter((_,i)=>i%step==0);
-  span.textContent=pts.length?'':'collecting...';
+  span.textContent=pts.length<2?'collecting...':'';
   if(pts.length<2)return;
   const sp=pts[pts.length-1].sp;
   // Scale to whichever is larger, setpoint or worst reading, so the setpoint
@@ -318,9 +450,16 @@ function draw(){
     pts.forEach((p,i)=>{const y=h-2-p[k]/max*(h-4);
       i?ctx.lineTo(X(p),y):ctx.moveTo(X(p),y)});
     ctx.stroke();};
-  ctx.strokeStyle='#555';ctx.setLineDash([4,4]);ctx.lineWidth=1;ctx.beginPath();
-  const spy=h-2-sp/top*(h-4);ctx.moveTo(0,spy);ctx.lineTo(w,spy);ctx.stroke();
+  const spy=h-2-sp/top*(h-4);
+  ctx.fillStyle='#ffffff10';ctx.fillRect(0,spy,w,h-spy);   // below-target shading
+  ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.moveTo(0,spy);ctx.lineTo(w,spy);ctx.stroke();
   ctx.setLineDash([]);
+  const lab='target '+Math.round(sp);
+  ctx.font='10px system-ui';
+  const tw=ctx.measureText(lab).width;
+  ctx.fillStyle='#000c';ctx.fillRect(w-tw-8,spy-13,tw+6,13);
+  ctx.fillStyle='#fff';ctx.fillText(lab,w-tw-5,spy-3);
   line('out',100,'#e94',1.5);
   line('pm',top,'#4a9',2);
   ctx.fillStyle='#666';ctx.font='10px system-ui';
@@ -339,11 +478,28 @@ async function tick(){
   tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
   mode.className=s.automatic?'on':''; mode.dataset.v=s.automatic?1:0;
-  warn.textContent=!s.sensorOk?'SENSOR LOST - output ramping to zero':
+  warn.className=stopped?'halt':'';
+  warn.textContent=stopped?'OUTPUT STOPPED':
+    !s.sensorOk?'SENSOR LOST - output ramping to zero':
     (s.pm25>=990?'sensor near saturation - readings unreliable':'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan; vla.textContent=s.lookahead;
+  s_cal=s.cal; pulseOn=s.pulse; vpp.textContent=s.pperiod;
+  pulsebtn.className=s.pulse?'on':'';
+  const on=(s.pperiod*s.output/100);
+  pulsestat.textContent=s.pulse?(s.output>0&&s.output<100?
+    on.toFixed(1)+'s on / '+(s.pperiod-on).toFixed(1)+'s off':
+    (s.output?'continuous':'off')):'';
+  cal.textContent=s.cal&&s.cal<4?'Cancel':'Calibrate';
+  cal.className=s.cal&&s.cal<4?'on':'';
+  calstat.textContent=['','settling...','pulsing 100%...','watching decay...',
+    s.calmsg,'failed: '+s.calmsg][s.cal]||'';
+  stopped=s.stopped;
+  // NB: id must not be "stop" - window.stop() already owns that name, so the
+  // element never shadows it and every property access here throws.
+  stopbtn.textContent=stopped?'STOPPED - resume':'STOP';
+  stopbtn.classList.toggle('armed',stopped);
   purging=s.purge>0;
   purge.textContent=purging?'Purging '+s.purge+'s (stop)':'Purge';
   purge.className=purging?'on':'';
@@ -351,7 +507,7 @@ async function tick(){
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
-    lookahead.value=s.lookahead;}
+    lookahead.value=s.lookahead;pperiod.value=s.pperiod;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   record(s.pm25,s.output,s.setpoint);
   draw();
@@ -359,26 +515,36 @@ async function tick(){
 tick();setInterval(tick,1000);
 </script>)HTML";
 
+// What is actually on the wire right now, pulsing included.
+uint8_t hazeLevel() {
+  if (cfg.pulseMode && !cfg.stopped && !purging() && !calibrating())
+    return dutyLevel(millis(), output, cfg.pulsePeriod, cfg.pulseLevel);
+  return output;
+}
+
 void handleState() {
-  char buf[520];
+  char buf[700];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
-           "\"slope\":%.2f,\"predicted\":%d,\"sensorOk\":%s}",
+           "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
+           "\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
            cfg.automatic ? "true" : "false", cfg.manual, cfg.setpoint,
            cfg.deadband, cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
-           toDmx(output), cfg.fixture,
+           toDmx(hazeLevel()), cfg.fixture,
            FIXTURES[cfg.fixture].fanOff >= 0 ? "true" : "false",
            maxAddress(FIXTURES[cfg.fixture].chans),
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
-           cfg.lookahead, pmSlope, predicted, sensorOk ? "true" : "false");
+           cfg.lookahead, pmSlope, predicted, cfg.stopped ? "true" : "false",
+           calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
+           sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -392,6 +558,21 @@ void handleSet() {
   if (server.hasArg("lookahead"))
     cfg.lookahead = constrain(server.arg("lookahead").toInt(), 0, 120);
   if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 100);
+  if (server.hasArg("save")) {
+    saveAt = 0;  // explicit save: write now rather than on the debounce
+    saveCfg();
+  }
+  if (server.hasArg("stop")) cfg.stopped = server.arg("stop").toInt();
+  if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
+  if (server.hasArg("pperiod"))
+    cfg.pulsePeriod = constrain(server.arg("pperiod").toInt(), 5, 60);
+  if (server.hasArg("calibrate")) {
+    if (server.arg("calibrate").toInt()) {
+      calState = CAL_SETTLE; calT0 = millis(); calMsg[0] = 0;
+    } else {
+      calState = CAL_OFF; calMsg[0] = 0;
+    }
+  }
   if (server.hasArg("purge")) {
     int secs = constrain(server.arg("purge").toInt(), 0, 600);
     purgeUntil = secs ? millis() + (unsigned long)secs * 1000 : 0;
@@ -488,7 +669,15 @@ void loop() {
 
   if (now - lastControl >= 1000) {
     lastControl = now;
-    if (purging()) {
+    if (cfg.stopped) {
+      calState = CAL_OFF;
+      // Latched, and snaps rather than slewing. The fan is deliberately left
+      // alone: it makes no haze, and running it helps clear what is already up.
+      target = 0;
+      output = 0;
+    } else if (calibrating()) {
+      runCalibration(now, data.pm25_env);
+    } else if (purging()) {
       // Snap off rather than slewing down. Slew exists to stop haze coming on
       // too fast; a purge is asking for it gone now, and cutting output is
       // always the safe direction.
@@ -509,7 +698,8 @@ void loop() {
       predicted = predict(data.pm25_env, pmSlope, cfg.lookahead);
       target = computeOutput(cfg.setpoint, predicted, cfg.deadband, cfg.gain);
     }
-    if (!purging()) output = applySlew(output, target, cfg.slew);
+    if (!purging() && !cfg.stopped && !calibrating())
+      output = applySlew(output, target, cfg.slew);
   }
 
   // Unconditional: frames keep going out at zero as well, so a receiver never
@@ -517,10 +707,11 @@ void loop() {
   if (now - lastDmx >= DMX_INTERVAL_MS) {
     lastDmx = now;
     const Fixture &f = FIXTURES[cfg.fixture];
+    uint8_t haze = hazeLevel();
     dmxData[0] = 0;  // DMX start code
     if (f.fanOff >= 0)
       dmxData[cfg.dmxAddress + f.fanOff] = toDmx(purging() ? 100 : cfg.fan);
-    dmxData[cfg.dmxAddress + f.hazeOff] = toDmx(output);
+    dmxData[cfg.dmxAddress + f.hazeOff] = toDmx(haze);
     dmxSend();
   }
 }
