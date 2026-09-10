@@ -57,6 +57,11 @@ PM25_AQI_Data data;
 bool sensorOk = false, everRead = false;
 uint8_t output = 0, target = 0;
 unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0, lastControl = 0;
+unsigned long purgeUntil = 0;
+
+// Purge clears the air with the machine's own fan: haze off, fan wide open.
+// Overflow-safe compare, so it cannot latch on at the millis() rollover.
+bool purging() { return purgeUntil && (int32_t)(millis() - purgeUntil) < 0; }
 
 // DMX512 straight onto the ESP32's UART: 250kbaud 8N2, a >=92us break, a
 // >=12us mark-after-break, then the slots. That is the entire protocol for a
@@ -151,6 +156,10 @@ button{background:#333;color:#eee;border:0;border-radius:6px;padding:8px 14px;fo
 button.on{background:#4a9;color:#000}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
 canvas{width:100%;height:150px;display:block;background:#1c1c1c;border-radius:8px}
+#win,#pdur{width:auto;margin:0 0 12px}
+details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
+summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:6px}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
 </style>
@@ -162,45 +171,93 @@ canvas{width:100%;height:150px;display:block;background:#1c1c1c;border-radius:8p
 <div class=c><span>AQI US</span><b id=aqi>-</b></div>
 <div class=c><span>0.3um count</span><b id=c03>-</b></div>
 <div class=c><span>Haze output</span><b id=out>-</b></div>
-<div class=c><span>DMX haze byte</span><b id=dmxh>-</b></div>
+<div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
+<div class=c><span>DMX fan</span><b id=dmxf>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
 <canvas id=chart></canvas>
 <div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze output %</i>
 <i style=color:#888>setpoint</i><i id=span></i></div>
-<button id=mode onclick="post('automatic',this.dataset.v==1?0:1)">-</button>
+<select id=win onchange="setWin(this.value)">
+<option value=60>1 minute</option><option value=300>5 minutes</option>
+<option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
+<option value=3600>1 hour</option><option value=7200>2 hours</option>
+<option value=21600>6 hours</option><option value=43200>12 hours</option>
+<option value=86400>24 hours</option><option value=604800>7 days</option></select>
+<div class=row><button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
+<button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button>
+<select id=pdur><option value=30>30s</option><option value=60 selected>1 min</option>
+<option value=120>2 min</option><option value=300>5 min</option></select></div>
 <label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)">
-<label>Setpoint PM2.5 <span id=vsp></span></label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
+<div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
+<label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
+<details><summary>Tuning</summary>
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
 <label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
+</details>
+<details><summary>Setup</summary>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
 <option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
 <option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
-<div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>DMX start address</label><input type=number id=dmxaddr min=1 max=511 onchange="post('dmxaddr',this.value)">
+</details>
 <script>
-let touching=0;
+let touching=0,purging=false;
 document.querySelectorAll('input[type=range]').forEach(e=>{
   e.onpointerdown=()=>touching=1; e.onpointerup=()=>touching=0;});
-function post(k,v){fetch('/api/set?'+k+'='+v)}
-const hist=[];
+// Coalesce changes into one request and refresh straight after, so a button
+// reflects its new state immediately instead of waiting for the 1s poll. Also
+// stops a slider drag firing a separate request per pixel.
+let pend={},flushT=null;
+function post(k,v){pend[k]=v;if(!flushT)flushT=setTimeout(flush,60);}
+function flush(){
+  flushT=null;
+  const q=new URLSearchParams(pend).toString();pend={};
+  if(q)fetch('/api/set?'+q).then(tick).catch(()=>{});
+}
+// Two resolutions: 1s detail for the last hour, 1-minute averages beyond it.
+// 7 days at 1Hz would be 604800 samples - too many to hold or to draw.
+const FINE=[],COARSE=[];let acc=null,winSec=600;
+function setWin(v){winSec=+v;draw();}
+function record(pm,out,sp){
+  const now=Date.now();
+  FINE.push({t:now,pm:pm,out:out,sp:sp});
+  while(FINE.length>3600)FINE.shift();
+  if(!acc||now-acc.t>=60000){
+    if(acc)COARSE.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,sp:acc.sp});
+    while(COARSE.length>10080)COARSE.shift();   // 7 days of minutes
+    acc={t:now,pm:0,out:0,sp:sp,n:0};
+  }
+  acc.pm+=pm;acc.out+=out;acc.sp=sp;acc.n++;
+}
+function series(){
+  if(winSec<=3600)return FINE;
+  const c=COARSE.slice();
+  if(acc&&acc.n)c.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,sp:acc.sp});
+  return c.length>1?c:FINE;   // nothing aggregated yet, show what we have
+}
 function draw(){
   const c=chart,ctx=c.getContext('2d'),dpr=devicePixelRatio||1;
   const w=c.clientWidth,h=150;
   c.width=w*dpr;c.height=h*dpr;ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,w,h);
-  if(hist.length<2)return;
-  const sp=hist[hist.length-1].sp;
-  // Scale to whichever is larger, the setpoint or the worst reading, so the
-  // setpoint line stays on screen even when the sensor pegs.
-  const top=Math.max(20,sp*1.3,...hist.map(p=>p.pm))*1.05;
-  const X=i=>i*(w-1)/(hist.length-1);
-  const line=(key,max,col,lw)=>{
+  const t1=Date.now(),t0=t1-winSec*1000;
+  let pts=series().filter(p=>p.t>=t0);
+  const step=Math.max(1,Math.ceil(pts.length/(w*2)));
+  if(step>1)pts=pts.filter((_,i)=>i%step==0);
+  span.textContent=pts.length?'':'collecting...';
+  if(pts.length<2)return;
+  const sp=pts[pts.length-1].sp;
+  // Scale to whichever is larger, setpoint or worst reading, so the setpoint
+  // line stays on screen even when the sensor pegs.
+  const top=Math.max(20,sp*1.3,...pts.map(p=>p.pm))*1.05;
+  const X=p=>(p.t-t0)/(t1-t0)*w;
+  const line=(k,max,col,lw)=>{
     ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
-    hist.forEach((p,i)=>{const y=h-2-p[key]/max*(h-4);
-      i?ctx.lineTo(X(i),y):ctx.moveTo(X(i),y)});
+    pts.forEach((p,i)=>{const y=h-2-p[k]/max*(h-4);
+      i?ctx.lineTo(X(p),y):ctx.moveTo(X(p),y)});
     ctx.stroke();};
   ctx.strokeStyle='#555';ctx.setLineDash([4,4]);ctx.lineWidth=1;ctx.beginPath();
   const spy=h-2-sp/top*(h-4);ctx.moveTo(0,spy);ctx.lineTo(w,spy);ctx.stroke();
@@ -209,13 +266,14 @@ function draw(){
   line('pm',top,'#4a9',2);
   ctx.fillStyle='#666';ctx.font='10px system-ui';
   ctx.fillText(Math.round(top)+' ug/m3',4,11);
+  ctx.fillText(winSec<=3600?'1s samples':'1 min averages',4,h-4);
 }
 addEventListener('resize',draw);
 async function tick(){
   let s=await(await fetch('/api/state')).json();
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
   aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
-  dmxh.textContent=s.dmxhaze;
+  dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   obar.style.width=s.output+'%';
   tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
@@ -225,14 +283,15 @@ async function tick(){
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
+  purging=s.purge>0;
+  purge.textContent=purging?'Purging '+s.purge+'s (stop)':'Purge';
+  purge.className=purging?'on':'';
   dmxaddr.max=s.maxaddr;
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
-  hist.push({pm:s.pm25,out:s.output,sp:s.setpoint});
-  if(hist.length>600)hist.shift();
-  span.textContent=hist.length<60?hist.length+'s':Math.round(hist.length/60)+' min';
+  record(s.pm25,s.output,s.setpoint);
   draw();
 }
 tick();setInterval(tick,1000);
@@ -245,7 +304,7 @@ void handleState() {
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"sensorOk\":%s}",
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -254,6 +313,8 @@ void handleState() {
            toDmx(output), cfg.fixture,
            FIXTURES[cfg.fixture].fanOff >= 0 ? "true" : "false",
            maxAddress(FIXTURES[cfg.fixture].chans),
+           purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
+           FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
@@ -266,6 +327,10 @@ void handleSet() {
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
   if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
   if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 100);
+  if (server.hasArg("purge")) {
+    int secs = constrain(server.arg("purge").toInt(), 0, 600);
+    purgeUntil = secs ? millis() + (unsigned long)secs * 1000 : 0;
+  }
   if (server.hasArg("fixture")) {
     int f = constrain(server.arg("fixture").toInt(), 0, (int)FIXTURE_COUNT - 1);
     if (f != cfg.fixture) {
@@ -301,6 +366,9 @@ void setup() {
   Serial.printf("DMX transmitting on GPIO%d, DE on GPIO%d\n", DMX_TX_PIN, DMX_EN_PIN);
 
   WiFi.mode(WIFI_STA);
+  // Modem sleep is on by default and adds ~100ms to every request, which makes
+  // the UI feel laggy. This box is mains powered; the tradeoff is not worth it.
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("wifi");
   unsigned long t0 = millis();
@@ -344,14 +412,20 @@ void loop() {
 
   if (now - lastControl >= 1000) {
     lastControl = now;
-    if (!cfg.automatic) {
+    if (purging()) {
+      // Snap off rather than slewing down. Slew exists to stop haze coming on
+      // too fast; a purge is asking for it gone now, and cutting output is
+      // always the safe direction.
+      target = 0;
+      output = 0;
+    } else if (!cfg.automatic) {
       target = cfg.manual;
     } else if (!everRead || !sensorOk) {
       target = 0;  // fail safe: never keep hazing on a stale reading
     } else {
       target = computeOutput(cfg.setpoint, data.pm25_env, cfg.deadband, cfg.gain);
     }
-    output = applySlew(output, target, cfg.slew);
+    if (!purging()) output = applySlew(output, target, cfg.slew);
   }
 
   // Unconditional: frames keep going out at zero as well, so a receiver never
@@ -360,7 +434,8 @@ void loop() {
     lastDmx = now;
     const Fixture &f = FIXTURES[cfg.fixture];
     dmxData[0] = 0;  // DMX start code
-    if (f.fanOff >= 0) dmxData[cfg.dmxAddress + f.fanOff] = toDmx(cfg.fan);
+    if (f.fanOff >= 0)
+      dmxData[cfg.dmxAddress + f.fanOff] = toDmx(purging() ? 100 : cfg.fan);
     dmxData[cfg.dmxAddress + f.hazeOff] = toDmx(output);
     dmxSend();
   }

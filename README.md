@@ -6,6 +6,8 @@ Regulates DMX haze machine output from a PMSA003I PM2.5 sensor. ESP32-S3 N16R8.
 - [x] PMSA003I over I2C
 - [x] Web UI for live readings + tuning
 - [x] DMX output (CTC-DRA-10-R2 shield)
+- [x] Live chart, selectable window (1 min to 7 days)
+- [x] Purge - haze off, fan wide open, for a set duration
 - [ ] BLE wifi provisioning
 - [ ] Local display + buttons
 
@@ -67,6 +69,11 @@ Note the order: **fan is channel 1, haze is channel 2.**
 No fan channel; the fan slider hides when this profile is selected. Needs
 2 minutes to heat up before it will output.
 
+**Set the fixture profile to match the machine actually connected.** The
+profiles put different functions on channel 1 - fan on the Amhaze, haze on the
+1DX. Selecting Amhaze while a 1DX is plugged in means Purge drives ch1 to 255
+expecting a fan, and the 1DX reads that as full haze output.
+
 Both machines share the same dead band: 000-010 does nothing, and 011-255 is
 1-100%. Control values are therefore percent throughout, and `toDmx()` maps
 0% to DMX 0 and 1-100% onto 11-255, so the number in the UI is the number the
@@ -89,6 +96,17 @@ one connected, so without it `Serial` goes to UART0 (GPIO43/44) and you see noth
 Then open http://haze.local/
 
 `haze_sensor_test/` is a standalone I2C scan + sensor readout for wiring problems.
+
+## Purge
+
+Purge clears the air using the *machine's* fan: haze snaps to 0 (bypassing the
+slew limit, since cutting output is always the safe direction) and the fan goes
+to 100% for the chosen duration. On the 1DX there is no fan channel, so purge
+just stops output.
+
+The PMSA003I has no purge function of its own. Its fan is either running or
+asleep, controlled by the SET pad on the breakout - not over I2C, and not
+reachable through the STEMMA QT cable, which carries only SDA, SCL, VIN, GND.
 
 ## Note on DMX libraries
 
