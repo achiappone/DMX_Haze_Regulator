@@ -4,6 +4,7 @@
 //         shield TX->GPIO17, shield 2->GPIO16, 5V, GND. Leave 0 and 3 open.
 #include <Adafruit_PM25AQI.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
@@ -18,6 +19,7 @@
 #define DMX_EN_PIN 16
 #define DMX_UART UART_NUM_1
 #define DMX_PACKET_SIZE 513  // start code + 512 slots
+#define SLOPE_WIN 30       // seconds of PM history used for the trend
 #define SENSOR_POLL_MS 250   // faster than the sensor's ~1s frame rate
 #define SENSOR_STALE_MS 5000
 #define DMX_INTERVAL_MS 30  // ~33Hz; full 513-slot packet takes ~23ms
@@ -25,6 +27,8 @@
 Adafruit_PM25AQI aqi;
 WebServer server(80);
 uint8_t dmxData[DMX_PACKET_SIZE];
+Preferences prefs;
+#define CFG_VERSION 1
 
 // Channel layout differs per machine. Offsets are from the start address; -1
 // means the fixture has no such channel. Both machines use the same 011-255
@@ -51,6 +55,7 @@ struct {
   int fan = 50;          // 0-100%, independent of haze regulation
   int dmxAddress = 1;    // start address; channel layout depends on fixture
   int fixture = 0;       // index into FIXTURES
+  int lookahead = 0;     // seconds to extrapolate the PM trend; 0 = off
 } cfg;
 
 PM25_AQI_Data data;
@@ -58,6 +63,11 @@ bool sensorOk = false, everRead = false;
 uint8_t output = 0, target = 0;
 unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0, lastControl = 0;
 unsigned long purgeUntil = 0;
+unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
+uint16_t pmHist[SLOPE_WIN];
+int pmCount = 0, pmIdx = 0;
+float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
+int predicted = 0;
 
 // Purge clears the air with the machine's own fan: haze off, fan wide open.
 // Overflow-safe compare, so it cannot latch on at the millis() rollover.
@@ -99,8 +109,48 @@ uint8_t toDmx(uint8_t pct) {
   return 11 + (uint16_t)(pct - 1) * 244 / 99;
 }
 
+// Trend over the whole window rather than between consecutive samples: the
+// PMSA003I is noisy enough that a two-point derivative is mostly noise.
+float slopeOf(int newest, int oldest, int samples) {
+  return samples < 2 ? 0.0f : (float)(newest - oldest) / (samples - 1);
+}
+
+// Where PM2.5 will be once haze commanded now actually reaches the sensor.
+// Controlling on this instead of the present reading is what buys back the
+// dead time between opening the machine and seeing the result.
+int predict(int pm, float slopePerSec, int lookaheadSec) {
+  long p = pm + lroundf(slopePerSec * lookaheadSec);
+  return p < 0 ? 0 : (p > 2000 ? 2000 : (int)p);
+}
+
 // A fixture occupying n channels cannot start later than 513-n.
 int maxAddress(uint8_t chans) { return DMX_PACKET_SIZE - chans; }
+
+// Settings survive a reboot or a reflash. Losing them silently was actively
+// dangerous: the fixture profile would revert to a 2-channel machine, and Purge
+// would then drive ch1 to full expecting a fan, which a 1DX reads as full haze.
+void saveCfg() {
+  prefs.putUInt("ver", CFG_VERSION);
+  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+}
+
+void loadCfg() {
+  if (prefs.getUInt("ver", 0) != CFG_VERSION ||
+      prefs.getBytesLength("cfg") != sizeof(cfg))
+    return;  // first boot, or the layout changed - keep compiled defaults
+  prefs.getBytes("cfg", &cfg, sizeof(cfg));
+  // Clamp everything: stored bytes are not trustworthy input.
+  cfg.fixture = constrain(cfg.fixture, 0, (int)FIXTURE_COUNT - 1);
+  cfg.dmxAddress =
+      constrain(cfg.dmxAddress, 1, maxAddress(FIXTURES[cfg.fixture].chans));
+  cfg.manual = constrain(cfg.manual, 0, 100);
+  cfg.fan = constrain(cfg.fan, 0, 100);
+  cfg.setpoint = constrain(cfg.setpoint, 0, 1000);
+  cfg.deadband = constrain(cfg.deadband, 0, 100);
+  cfg.gain = constrain(cfg.gain, 0.1f, 10.0f);
+  cfg.slew = constrain(cfg.slew, 1, 100);
+  cfg.lookahead = constrain(cfg.lookahead, 0, 120);
+}
 
 // Proportional with deadband. Pure, so selfTest() can check it.
 uint8_t computeOutput(int setpoint, int pm25, int deadband, float gain) {
@@ -135,6 +185,12 @@ void selfTest() {
   assert(toDmx(50) == 131);   // 50% lands mid-band
   assert(maxAddress(2) == 511);  // Amhaze, 2ch
   assert(maxAddress(1) == 512);  // Hurricane Haze 1DX, 1ch
+  assert(slopeOf(100, 10, 31) == 3.0f);      // +90 over 30s
+  assert(slopeOf(10, 100, 31) == -3.0f);     // falling
+  assert(slopeOf(50, 50, 1) == 0.0f);        // too few samples
+  assert(predict(100, -2.0f, 30) == 40);     // falling fast, act early
+  assert(predict(10, -2.0f, 30) == 0);       // clamps at zero
+  assert(predict(100, 0.0f, 30) == 100);     // flat trend changes nothing
   Serial.println("selfTest ok");
 }
 
@@ -173,6 +229,8 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div class=c><span>Haze output</span><b id=out>-</b></div>
 <div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
 <div class=c><span>DMX fan</span><b id=dmxf>-</b></div>
+<div class=c><span>trend ug/m3/s</span><b id=slope>-</b></div>
+<div class=c><span>predicted PM2.5</span><b id=pred>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
@@ -196,6 +254,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
 <label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
+<label>Lookahead <span id=vla></span>s <i style=color:#666>(0 = react only)</i></label><input type=range id=lookahead min=0 max=120 oninput="post('lookahead',this.value)">
 </details>
 <details><summary>Setup</summary>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
@@ -274,6 +333,8 @@ async function tick(){
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
   aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
+  slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
+  pred.textContent=s.lookahead?s.predicted:'off';
   obar.style.width=s.output+'%';
   tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
@@ -282,14 +343,15 @@ async function tick(){
     (s.pm25>=990?'sensor near saturation - readings unreliable':'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
-  vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
+  vfan.textContent=s.fan; fanrow.hidden=!s.hasfan; vla.textContent=s.lookahead;
   purging=s.purge>0;
   purge.textContent=purging?'Purging '+s.purge+'s (stop)':'Purge';
   purge.className=purging?'on':'';
   dmxaddr.max=s.maxaddr;
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
-    deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;}
+    deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
+    lookahead.value=s.lookahead;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   record(s.pm25,s.output,s.setpoint);
   draw();
@@ -298,13 +360,14 @@ tick();setInterval(tick,1000);
 </script>)HTML";
 
 void handleState() {
-  char buf[440];
+  char buf[520];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"sensorOk\":%s}",
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
+           "\"slope\":%.2f,\"predicted\":%d,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -315,7 +378,7 @@ void handleState() {
            maxAddress(FIXTURES[cfg.fixture].chans),
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
-           sensorOk ? "true" : "false");
+           cfg.lookahead, pmSlope, predicted, sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -326,6 +389,8 @@ void handleSet() {
   if (server.hasArg("deadband")) cfg.deadband = constrain(server.arg("deadband").toInt(), 0, 100);
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
   if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
+  if (server.hasArg("lookahead"))
+    cfg.lookahead = constrain(server.arg("lookahead").toInt(), 0, 120);
   if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 100);
   if (server.hasArg("purge")) {
     int secs = constrain(server.arg("purge").toInt(), 0, 600);
@@ -349,6 +414,7 @@ void handleSet() {
   // A fixture switch can leave the address past the new limit.
   cfg.dmxAddress = constrain(cfg.dmxAddress, 1,
                              maxAddress(FIXTURES[cfg.fixture].chans));
+  saveAt = millis() + 2000;  // write once the user stops fiddling
   server.send(200, "text/plain", "ok");
 }
 
@@ -356,6 +422,11 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
   selfTest();
+
+  prefs.begin("haze", false);
+  loadCfg();
+  Serial.printf("fixture: %s, addr %d\n", FIXTURES[cfg.fixture].name,
+                cfg.dmxAddress);
 
   Wire.begin(SDA_PIN, SCL_PIN);
   sensorOk = aqi.begin_I2C(&Wire);
@@ -396,6 +467,11 @@ void loop() {
   server.handleClient();
   unsigned long now = millis();
 
+  if (saveAt && (int32_t)(now - saveAt) >= 0) {
+    saveAt = 0;
+    saveCfg();
+  }
+
   // The PMSA003I emits a frame about once a second on its own schedule, so a
   // failed read is routine, not a fault. Poll faster than that and judge health
   // only by how long it has been since a *good* read.
@@ -423,7 +499,15 @@ void loop() {
     } else if (!everRead || !sensorOk) {
       target = 0;  // fail safe: never keep hazing on a stale reading
     } else {
-      target = computeOutput(cfg.setpoint, data.pm25_env, cfg.deadband, cfg.gain);
+      pmHist[pmIdx] = data.pm25_env;
+      pmIdx = (pmIdx + 1) % SLOPE_WIN;
+      if (pmCount < SLOPE_WIN) pmCount++;
+      pmSlope = pmCount < 5 ? 0
+                            : slopeOf(pmHist[(pmIdx - 1 + SLOPE_WIN) % SLOPE_WIN],
+                                      pmHist[(pmIdx - pmCount + SLOPE_WIN) % SLOPE_WIN],
+                                      pmCount);
+      predicted = predict(data.pm25_env, pmSlope, cfg.lookahead);
+      target = computeOutput(cfg.setpoint, predicted, cfg.deadband, cfg.gain);
     }
     if (!purging()) output = applySlew(output, target, cfg.slew);
   }
