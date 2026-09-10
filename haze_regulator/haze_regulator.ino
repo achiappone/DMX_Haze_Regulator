@@ -490,7 +490,7 @@ function draw(){
   if(step>1)pts=pts.filter((_,i)=>i%step==0);
   span.textContent=pts.length<2?'collecting...':'';
   if(pts.length<2)return;
-  const ML=56,MR=50,MT=14,MB=22,pw=w-ML-MR,ph=h-MT-MB;
+  const ML=56,MR=50,MT=30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
   const sp=pts[pts.length-1].sp;
   const peak=Math.max(...pts.map(p=>p.pm));
   // Left axis follows the data but never hides the target line.
@@ -540,9 +540,9 @@ function draw(){
   ctx.font='11px system-ui';ctx.fillStyle='#777';
   ctx.fillText(winSec<=3600?'1s samples':'1 min averages',ML,h-8);
   ctx.textAlign='right';
-  ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-7,MT-5);
+  ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-8,12);
   ctx.textAlign='left';
-  ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+7,MT-5);
+  ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
   ctx.textAlign='left';
 }
 addEventListener('resize',draw);
