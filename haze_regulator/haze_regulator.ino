@@ -76,8 +76,9 @@ enum { CAL_OFF = 0, CAL_PURGE, CAL_SETTLE, CAL_PULSE, CAL_DECAY, CAL_DONE, CAL_F
 int calState = CAL_OFF;
 unsigned long calT0 = 0, calPeakT = 0;
 int calBaseline = 0, calPeak = 0, calDead = 0, calTau = 0, calPulseUsed = 0;
+bool calBaseHigh = false;
 float calRise = 0;
-char calMsg[72] = "";
+char calMsg[128] = "";
 bool calibrating() { return calState >= CAL_PURGE && calState <= CAL_DECAY; }
 
 uint16_t pmHist[SLOPE_WIN];
@@ -173,6 +174,9 @@ void calFinish() {
            "pulse %ds, dead %ds, rise %.1f ug/s, decay %ds -> look %d slew %d gain %.1f",
            calPulseUsed, calDead, calRise, calTau, cfg.lookahead, cfg.slew,
            cfg.gain);
+  if (calBaseHigh)
+    strncat(calMsg, " (hazy baseline: rise may be understated)",
+            sizeof(calMsg) - strlen(calMsg) - 1);
   calState = CAL_DONE;
   target = output = 0;
   saveAt = millis() + 500;
@@ -187,12 +191,16 @@ void runCalibration(unsigned long now, int pm) {
       // excursion against the sensor ceiling and gives a useless rise rate.
       target = output = 0;
       purgeUntil = now + 2000;  // rolling, so the fan stays open via purge
-      if (pm < 60 || (el > 60 && pmSlope > -0.3f) || el > 900) {
+      // A room with no forced ventilation clears slowly, so "stopped falling"
+      // needs minutes of evidence, not one minute. Only refuse when the sensor
+      // ceiling leaves no room for a measurable excursion at all.
+      if (pm < 60 || el > 1800 || (el > 300 && pmSlope > -0.1f)) {
         purgeUntil = 0;
-        if (pm > 700) {
-          calFail("room too hazy to calibrate - clear it and retry");
+        if (pm > 850) {
+          calFail("still above 850 ug/m3 - ventilate the room and retry");
           break;
         }
+        calBaseHigh = pm > 400;
         calT0 = now;
         calState = CAL_SETTLE;
       }
@@ -391,8 +399,8 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
 <canvas id=chart></canvas>
-<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze output %</i>
-<i style=color:#888>setpoint</i><i id=span></i></div>
+<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze demand %</i><i style=color:#e9944490>actual on wire</i>
+<i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
 <select id=win onchange="setWin(this.value)">
 <option value=30>30 seconds</option><option value=60>1 minute</option><option value=300>5 minutes</option>
 <option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
@@ -448,21 +456,22 @@ function flush(){
 // 7 days at 1Hz would be 604800 samples - too many to hold or to draw.
 const FINE=[],COARSE=[];let acc=null,winSec=600;
 function setWin(v){winSec=+v;draw();}
-function record(pm,out,sp){
+function record(pm,out,act,sp){
   const now=Date.now();
-  FINE.push({t:now,pm:pm,out:out,sp:sp});
-  while(FINE.length>3600)FINE.shift();
+  FINE.push({t:now,pm:pm,out:out,act:act,sp:sp});
+  while(FINE.length>7200)FINE.shift();   // 2Hz, so an hour of detail
   if(!acc||now-acc.t>=60000){
-    if(acc)COARSE.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,sp:acc.sp});
+    if(acc)COARSE.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,
+                        act:acc.act/acc.n,sp:acc.sp});
     while(COARSE.length>10080)COARSE.shift();   // 7 days of minutes
-    acc={t:now,pm:0,out:0,sp:sp,n:0};
+    acc={t:now,pm:0,out:0,act:0,sp:sp,n:0};
   }
-  acc.pm+=pm;acc.out+=out;acc.sp=sp;acc.n++;
+  acc.pm+=pm;acc.out+=out;acc.act+=act;acc.sp=sp;acc.n++;
 }
 function series(){
   if(winSec<=3600)return FINE;
   const c=COARSE.slice();
-  if(acc&&acc.n)c.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,sp:acc.sp});
+  if(acc&&acc.n)c.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,act:acc.act/acc.n,sp:acc.sp});
   return c.length>1?c:FINE;   // nothing aggregated yet, show what we have
 }
 function draw(){
@@ -476,33 +485,58 @@ function draw(){
   if(step>1)pts=pts.filter((_,i)=>i%step==0);
   span.textContent=pts.length<2?'collecting...':'';
   if(pts.length<2)return;
+  const ML=48,MR=44,MT=12,MB=20,pw=w-ML-MR,ph=h-MT-MB;
   const sp=pts[pts.length-1].sp;
-  // Scale to whichever is larger, setpoint or worst reading, so the setpoint
-  // line stays on screen even when the sensor pegs.
-  const top=Math.max(20,sp*1.3,...pts.map(p=>p.pm))*1.05;
-  const X=p=>(p.t-t0)/(t1-t0)*w;
-  const line=(k,max,col,lw)=>{
-    ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
-    pts.forEach((p,i)=>{const y=h-2-p[k]/max*(h-4);
-      i?ctx.lineTo(X(p),y):ctx.moveTo(X(p),y)});
-    ctx.stroke();};
-  const spy=h-2-sp/top*(h-4);
-  ctx.fillStyle='#ffffff10';ctx.fillRect(0,spy,w,h-spy);   // below-target shading
+  const peak=Math.max(...pts.map(p=>p.pm));
+  // Left axis follows the data but never hides the target line.
+  const top=Math.max(20,sp*1.25,peak)*1.08;
+  const X=p=>ML+(p.t-t0)/(t1-t0)*pw;
+  const Ypm=v=>MT+ph-v/top*ph;
+  const Ypc=v=>MT+ph-v/100*ph;
+  peakLbl.textContent='peak '+Math.round(peak);
+
+  ctx.font='11px system-ui';ctx.textBaseline='middle';
+  for(let i=0;i<=4;i++){
+    const y=MT+ph-i/4*ph;
+    ctx.strokeStyle='#ffffff12';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(ML,y);ctx.lineTo(ML+pw,y);ctx.stroke();
+    ctx.fillStyle='#4a9';ctx.textAlign='right';
+    ctx.fillText(Math.round(top*i/4),ML-7,y);
+    ctx.fillStyle='#e94';ctx.textAlign='left';
+    ctx.fillText(i*25+'%',ML+pw+7,y);
+  }
+  ctx.textAlign='left';
+
+  const spy=Ypm(sp);
   ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=1.5;
-  ctx.beginPath();ctx.moveTo(0,spy);ctx.lineTo(w,spy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(ML,spy);ctx.lineTo(ML+pw,spy);ctx.stroke();
   ctx.setLineDash([]);
   const lab='target '+Math.round(sp);
   ctx.font='bold 14px system-ui';
   const tw=ctx.measureText(lab).width;
-  // Flip below the line when the setpoint sits near the top of the plot.
-  const by=spy<22?spy+2:spy-19;
-  ctx.fillStyle='#000c';ctx.fillRect(w-tw-12,by,tw+9,18);
-  ctx.fillStyle='#fff';ctx.fillText(lab,w-tw-7,by+13);
-  line('out',100,'#e94',1.5);
-  line('pm',top,'#4a9',2);
-  ctx.fillStyle='#666';ctx.font='10px system-ui';
-  ctx.fillText(Math.round(top)+' ug/m3',4,11);
-  ctx.fillText(winSec<=3600?'1s samples':'1 min averages',4,h-4);
+  const by=spy<MT+20?spy+3:spy-20;
+  ctx.fillStyle='#000c';ctx.fillRect(ML+pw-tw-11,by,tw+9,19);
+  ctx.fillStyle='#fff';ctx.fillText(lab,ML+pw-tw-6,by+13);
+
+  // Shaded area is what is actually on the wire (pulses included); the solid
+  // line is what the controller is asking for.
+  ctx.fillStyle='#e9944440';ctx.beginPath();
+  ctx.moveTo(X(pts[0]),MT+ph);
+  pts.forEach(p=>ctx.lineTo(X(p),Ypc(p.act||0)));
+  ctx.lineTo(X(pts[pts.length-1]),MT+ph);ctx.closePath();ctx.fill();
+
+  const line=(f,col,lw)=>{
+    ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
+    pts.forEach((p,i)=>{const y=f(p);i?ctx.lineTo(X(p),y):ctx.moveTo(X(p),y)});
+    ctx.stroke();};
+  line(p=>Ypc(p.out),'#e94',1.5);
+  line(p=>Ypm(p.pm),'#4a9',2);
+
+  ctx.font='10px system-ui';ctx.fillStyle='#666';
+  ctx.fillText(winSec<=3600?'1s samples':'1 min averages',ML,h-7);
+  ctx.textAlign='right';
+  ctx.fillText('ug/m3',ML-7,MT-4);
+  ctx.textAlign='left';
 }
 addEventListener('resize',draw);
 async function tick(){
@@ -533,7 +567,7 @@ async function tick(){
   cal.className=s.cal&&s.cal<5?'on':'';
   if(document.activeElement!=calpulse)calpulse.value=s.calpulse;
   const lt=s.calleft?' ('+s.calleft+'s)':'';
-  calstat.textContent=['','purging the room...','settling'+lt,'pulsing 100%'+lt,
+  calstat.textContent=['','purging the room'+lt,'settling'+lt,'pulsing 100%'+lt,
     'watching decay...',s.calmsg,'failed: '+s.calmsg][s.cal]||'';
   stopped=s.stopped;
   // NB: id must not be "stop" - window.stop() already owns that name, so the
@@ -549,15 +583,16 @@ async function tick(){
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
     lookahead.value=s.lookahead;pperiod.value=s.pperiod;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
-  record(s.pm25,s.output,s.setpoint);
+  record(s.pm25,s.output,s.haze,s.setpoint);
   draw();
 }
-tick();setInterval(tick,1000);
+tick();setInterval(tick,500);
 </script>)HTML";
 
 // Seconds left in the current calibration phase; 0 when it cannot be known.
 int calLeft() {
   unsigned long el = (millis() - calT0) / 1000;
+  if (calState == CAL_PURGE) return (int)el;  // elapsed, not remaining
   if (calState == CAL_SETTLE) return max(0, (int)(CAL_SETTLE_S - el));
   if (calState == CAL_PULSE) return max(0, (int)(cfg.calPulse - el));
   return 0;
@@ -571,7 +606,7 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[760];
+  char buf[860];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
@@ -579,7 +614,7 @@ void handleState() {
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
-           "\"calpulse\":%d,\"calleft\":%d,\"sensorOk\":%s}",
+           "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -592,7 +627,7 @@ void handleState() {
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.lookahead, pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
-           cfg.calPulse, calLeft(), sensorOk ? "true" : "false");
+           cfg.calPulse, calLeft(), hazeLevel(), sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
