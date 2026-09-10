@@ -317,7 +317,7 @@ void selfTest() {
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Haze Regulator</title><style>
-body{font:15px system-ui;margin:0;padding:16px;background:#111;color:#eee}
+body{font:15px system-ui;margin:0 auto;max-width:820px;padding:20px 28px;background:#111;color:#eee}
 h1{font-size:17px;margin:0 0 12px}
 .g{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px;margin-bottom:14px}
 .c{background:#1c1c1c;border-radius:8px;padding:10px}
@@ -335,7 +335,7 @@ button.stop{background:#c0392b;color:#fff;font-weight:600;letter-spacing:.5px}
 button.stop.armed{background:#e74c3c;box-shadow:0 0 0 2px #e74c3c55}
 #warn.halt{color:#e74c3c;font-weight:600}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
-canvas{width:100%;height:300px;display:block;background:#1c1c1c;border-radius:8px}
+canvas{width:100%;height:360px;display:block;background:#1c1c1c;border-radius:8px}
 #win,#pdur{width:auto;margin:0 0 12px}
 details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
@@ -457,10 +457,12 @@ function draw(){
   ctx.beginPath();ctx.moveTo(0,spy);ctx.lineTo(w,spy);ctx.stroke();
   ctx.setLineDash([]);
   const lab='target '+Math.round(sp);
-  ctx.font='10px system-ui';
+  ctx.font='bold 14px system-ui';
   const tw=ctx.measureText(lab).width;
-  ctx.fillStyle='#000c';ctx.fillRect(w-tw-8,spy-13,tw+6,13);
-  ctx.fillStyle='#fff';ctx.fillText(lab,w-tw-5,spy-3);
+  // Flip below the line when the setpoint sits near the top of the plot.
+  const by=spy<22?spy+2:spy-19;
+  ctx.fillStyle='#000c';ctx.fillRect(w-tw-12,by,tw+9,18);
+  ctx.fillStyle='#fff';ctx.fillText(lab,w-tw-7,by+13);
   line('out',100,'#e94',1.5);
   line('pm',top,'#4a9',2);
   ctx.fillStyle='#666';ctx.font='10px system-ui';
