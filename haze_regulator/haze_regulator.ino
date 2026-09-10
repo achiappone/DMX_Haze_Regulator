@@ -59,6 +59,7 @@ struct {
   bool pulseMode = false;  // time-proportional output instead of continuous
   int pulsePeriod = 10;    // seconds per pulse cycle
   int pulseLevel = 100;    // output % during the on part of the cycle
+  int calPulse = 30;       // calibration pulse length, seconds
 } cfg;
 
 PM25_AQI_Data data;
@@ -72,10 +73,9 @@ unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // output, and how slowly it clears. Guessing these is what causes overshoot.
 enum { CAL_OFF = 0, CAL_SETTLE, CAL_PULSE, CAL_DECAY, CAL_DONE, CAL_FAIL };
 #define CAL_SETTLE_S 10
-#define CAL_PULSE_S 15
 int calState = CAL_OFF;
 unsigned long calT0 = 0, calPeakT = 0;
-int calBaseline = 0, calPeak = 0, calDead = 0, calTau = 0;
+int calBaseline = 0, calPeak = 0, calDead = 0, calTau = 0, calPulseUsed = 0;
 float calRise = 0;
 char calMsg[72] = "";
 bool calibrating() { return calState >= CAL_SETTLE && calState <= CAL_DECAY; }
@@ -163,14 +163,16 @@ void calFail(const char *m) {
 // clears over many minutes, so overshoot is far more expensive than droop.
 void calFinish() {
   if (calDead < 1) calDead = 1;
-  calRise = (float)(calPeak - calBaseline) / CAL_PULSE_S;
+  if (calPulseUsed < 1) calPulseUsed = 1;
+  calRise = (float)(calPeak - calBaseline) / calPulseUsed;
   cfg.lookahead = constrain(calDead, 0, 120);
   cfg.slew = constrain(100 / calDead, 1, 100);
   if (calRise > 0.01f)
     cfg.gain = constrain(50.0f / (calRise * calDead), 0.1f, 10.0f);
   snprintf(calMsg, sizeof(calMsg),
-           "dead %ds, rise %.1f ug/s, decay %ds -> look %d, slew %d, gain %.1f",
-           calDead, calRise, calTau, cfg.lookahead, cfg.slew, cfg.gain);
+           "pulse %ds, dead %ds, rise %.1f ug/s, decay %ds -> look %d slew %d gain %.1f",
+           calPulseUsed, calDead, calRise, calTau, cfg.lookahead, cfg.slew,
+           cfg.gain);
   calState = CAL_DONE;
   target = output = 0;
   saveAt = millis() + 500;
@@ -184,6 +186,7 @@ void runCalibration(unsigned long now, int pm) {
       target = output = 0;
       if (el >= CAL_SETTLE_S) {
         calBaseline = pm; calPeak = pm; calDead = 0; calPeakT = 0;
+        calPulseUsed = 0;
         calT0 = now; calState = CAL_PULSE;
       }
       break;
@@ -191,12 +194,18 @@ void runCalibration(unsigned long now, int pm) {
       target = output = 100;
       if (pm > calPeak) { calPeak = pm; calPeakT = now; }
       if (!calDead && pm > trig) calDead = el < 1 ? 1 : el;
-      if (el >= CAL_PULSE_S) { calT0 = now; calState = CAL_DECAY; }
+      // Stop early if the sensor nears its ~1000 ug/m3 ceiling: a saturated
+      // reading flattens the peak and would understate the rise rate.
+      if (el >= (unsigned long)cfg.calPulse || pm >= 900) {
+        calPulseUsed = el < 1 ? 1 : el;
+        calT0 = now;
+        calState = CAL_DECAY;
+      }
       break;
     case CAL_DECAY:
       target = output = 0;
       if (pm > calPeak) { calPeak = pm; calPeakT = now; }
-      if (!calDead && pm > trig) calDead = CAL_PULSE_S + el;
+      if (!calDead && pm > trig) calDead = calPulseUsed + el;
       if (!calDead && el > 45) {
         calFail("no PM rise - machine off, not hazing, or sensor too far");
         break;
@@ -206,8 +215,8 @@ void runCalibration(unsigned long now, int pm) {
           pm <= calBaseline + (calPeak - calBaseline) * 37 / 100) {
         calTau = (now - calPeakT) / 1000;
         calFinish();
-      } else if (el > 900) {  // still hazy after 15 min; record and move on
-        calTau = 900;
+      } else if (el > (unsigned long)max(900, cfg.calPulse * 4)) {
+        calTau = el;  // never fell to 37%; record what we waited
         calFinish();
       }
       break;
@@ -235,6 +244,7 @@ void saveCfg() {
   prefs.putBool("pulse", cfg.pulseMode);
   prefs.putInt("pperiod", cfg.pulsePeriod);
   prefs.putInt("plevel", cfg.pulseLevel);
+  prefs.putInt("calpulse", cfg.calPulse);
 }
 
 void loadCfg() {
@@ -252,6 +262,7 @@ void loadCfg() {
   cfg.pulseMode = prefs.getBool("pulse", cfg.pulseMode);
   cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
   cfg.pulseLevel = prefs.getInt("plevel", cfg.pulseLevel);
+  cfg.calPulse = prefs.getInt("calpulse", cfg.calPulse);
   // Clamp everything: stored bytes are not trustworthy input.
   cfg.fixture = constrain(cfg.fixture, 0, (int)FIXTURE_COUNT - 1);
   cfg.dmxAddress =
@@ -265,6 +276,7 @@ void loadCfg() {
   cfg.lookahead = constrain(cfg.lookahead, 0, 120);
   cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
   cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
+  cfg.calPulse = constrain(cfg.calPulse, 30, 600);
 }
 
 // Proportional with deadband. Pure, so selfTest() can check it.
@@ -382,7 +394,11 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
 <details><summary>Tuning</summary>
-<div class=row><button id=cal onclick="post('calibrate',s_cal?0:1)">Calibrate</button>
+<div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<4?0:1)">Calibrate</button>
+<select id=calpulse onchange="post('calpulse',this.value)">
+<option value=30>30s pulse</option><option value=60>1 min</option>
+<option value=120>2 min</option><option value=300>5 min</option>
+<option value=600>10 min</option></select>
 <i id=calstat style=color:#888;font-size:12px></i></div>
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
@@ -500,7 +516,9 @@ async function tick(){
     (s.output?'continuous':'off')):'';
   cal.textContent=s.cal&&s.cal<4?'Cancel':'Calibrate';
   cal.className=s.cal&&s.cal<4?'on':'';
-  calstat.textContent=['','settling...','pulsing 100%...','watching decay...',
+  if(document.activeElement!=calpulse)calpulse.value=s.calpulse;
+  const lt=s.calleft?' ('+s.calleft+'s)':'';
+  calstat.textContent=['','settling'+lt,'pulsing 100%'+lt,'watching decay...',
     s.calmsg,'failed: '+s.calmsg][s.cal]||'';
   stopped=s.stopped;
   // NB: id must not be "stop" - window.stop() already owns that name, so the
@@ -522,6 +540,14 @@ async function tick(){
 tick();setInterval(tick,1000);
 </script>)HTML";
 
+// Seconds left in the current calibration phase; 0 when it cannot be known.
+int calLeft() {
+  unsigned long el = (millis() - calT0) / 1000;
+  if (calState == CAL_SETTLE) return max(0, (int)(CAL_SETTLE_S - el));
+  if (calState == CAL_PULSE) return max(0, (int)(cfg.calPulse - el));
+  return 0;
+}
+
 // What is actually on the wire right now, pulsing included.
 uint8_t hazeLevel() {
   if (cfg.pulseMode && !cfg.stopped && !purging() && !calibrating())
@@ -530,7 +556,7 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[700];
+  char buf[760];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
@@ -538,7 +564,7 @@ void handleState() {
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
-           "\"sensorOk\":%s}",
+           "\"calpulse\":%d,\"calleft\":%d,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -551,7 +577,7 @@ void handleState() {
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.lookahead, pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
-           sensorOk ? "true" : "false");
+           cfg.calPulse, calLeft(), sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -571,6 +597,8 @@ void handleSet() {
   }
   if (server.hasArg("stop")) cfg.stopped = server.arg("stop").toInt();
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
+  if (server.hasArg("calpulse"))
+    cfg.calPulse = constrain(server.arg("calpulse").toInt(), 30, 600);
   if (server.hasArg("pperiod"))
     cfg.pulsePeriod = constrain(server.arg("pperiod").toInt(), 5, 60);
   if (server.hasArg("calibrate")) {
