@@ -60,6 +60,7 @@ struct {
   int pulsePeriod = 10;    // seconds per pulse cycle
   int pulseLevel = 100;    // output % during the on part of the cycle
   int calPulse = 30;       // calibration pulse length, seconds
+  int pulseMinOn = 2;      // auto mode: shortest burst worth firing, seconds
 } cfg;
 
 PM25_AQI_Data data;
@@ -268,6 +269,7 @@ void saveCfg() {
   prefs.putInt("pperiod", cfg.pulsePeriod);
   prefs.putInt("plevel", cfg.pulseLevel);
   prefs.putInt("calpulse", cfg.calPulse);
+  prefs.putInt("pminon", cfg.pulseMinOn);
 }
 
 void loadCfg() {
@@ -286,6 +288,7 @@ void loadCfg() {
   cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
   cfg.pulseLevel = prefs.getInt("plevel", cfg.pulseLevel);
   cfg.calPulse = prefs.getInt("calpulse", cfg.calPulse);
+  cfg.pulseMinOn = prefs.getInt("pminon", cfg.pulseMinOn);
   // Clamp everything: stored bytes are not trustworthy input.
   cfg.fixture = constrain(cfg.fixture, 0, (int)FIXTURE_COUNT - 1);
   cfg.dmxAddress =
@@ -300,6 +303,7 @@ void loadCfg() {
   cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
   cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
   cfg.calPulse = constrain(cfg.calPulse, 30, 600);
+  cfg.pulseMinOn = constrain(cfg.pulseMinOn, 1, 10);
 }
 
 // Proportional with deadband. Pure, so selfTest() can check it.
@@ -428,7 +432,8 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
 <div class=row><button id=pulsebtn onclick="post('pulse',pulseOn?0:1)">Pulse mode</button>
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
-<label>Pulse period <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)">
+<label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)">
+<label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)">
 <label>Lookahead <span id=vla></span>s <i style=color:#666>(0 = react only)</i></label><input type=range id=lookahead min=0 max=120 oninput="post('lookahead',this.value)">
 </details>
 <details><summary>Setup</summary>
@@ -485,7 +490,7 @@ function draw(){
   if(step>1)pts=pts.filter((_,i)=>i%step==0);
   span.textContent=pts.length<2?'collecting...':'';
   if(pts.length<2)return;
-  const ML=48,MR=44,MT=12,MB=20,pw=w-ML-MR,ph=h-MT-MB;
+  const ML=56,MR=50,MT=14,MB=22,pw=w-ML-MR,ph=h-MT-MB;
   const sp=pts[pts.length-1].sp;
   const peak=Math.max(...pts.map(p=>p.pm));
   // Left axis follows the data but never hides the target line.
@@ -495,15 +500,15 @@ function draw(){
   const Ypc=v=>MT+ph-v/100*ph;
   peakLbl.textContent='peak '+Math.round(peak);
 
-  ctx.font='11px system-ui';ctx.textBaseline='middle';
+  ctx.font='12px system-ui';ctx.textBaseline='middle';  // fixed, never scaled
   for(let i=0;i<=4;i++){
     const y=MT+ph-i/4*ph;
     ctx.strokeStyle='#ffffff12';ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(ML,y);ctx.lineTo(ML+pw,y);ctx.stroke();
     ctx.fillStyle='#4a9';ctx.textAlign='right';
-    ctx.fillText(Math.round(top*i/4),ML-7,y);
+    ctx.fillText(Math.round(top*i/4),ML-8,y);
     ctx.fillStyle='#e94';ctx.textAlign='left';
-    ctx.fillText(i*25+'%',ML+pw+7,y);
+    ctx.fillText(i*25+'%',ML+pw+8,y);
   }
   ctx.textAlign='left';
 
@@ -512,11 +517,11 @@ function draw(){
   ctx.beginPath();ctx.moveTo(ML,spy);ctx.lineTo(ML+pw,spy);ctx.stroke();
   ctx.setLineDash([]);
   const lab='target '+Math.round(sp);
-  ctx.font='bold 14px system-ui';
+  ctx.font='bold 17px system-ui';   // fixed: only the number changes, not the size
   const tw=ctx.measureText(lab).width;
-  const by=spy<MT+20?spy+3:spy-20;
-  ctx.fillStyle='#000c';ctx.fillRect(ML+pw-tw-11,by,tw+9,19);
-  ctx.fillStyle='#fff';ctx.fillText(lab,ML+pw-tw-6,by+13);
+  const by=spy<MT+24?spy+3:spy-24;
+  ctx.fillStyle='#000d';ctx.fillRect(ML+pw-tw-13,by,tw+11,23);
+  ctx.fillStyle='#fff';ctx.fillText(lab,ML+pw-tw-7,by+16);
 
   // Shaded area is what is actually on the wire (pulses included); the solid
   // line is what the controller is asking for.
@@ -532,10 +537,12 @@ function draw(){
   line(p=>Ypc(p.out),'#e94',1.5);
   line(p=>Ypm(p.pm),'#4a9',2);
 
-  ctx.font='10px system-ui';ctx.fillStyle='#666';
-  ctx.fillText(winSec<=3600?'1s samples':'1 min averages',ML,h-7);
+  ctx.font='11px system-ui';ctx.fillStyle='#777';
+  ctx.fillText(winSec<=3600?'1s samples':'1 min averages',ML,h-8);
   ctx.textAlign='right';
-  ctx.fillText('ug/m3',ML-7,MT-4);
+  ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-7,MT-5);
+  ctx.textAlign='left';
+  ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+7,MT-5);
   ctx.textAlign='left';
 }
 addEventListener('resize',draw);
@@ -557,11 +564,12 @@ async function tick(){
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan; vla.textContent=s.lookahead;
-  s_cal=s.cal; pulseOn=s.pulse; vpp.textContent=s.pperiod;
+  s_cal=s.cal; pulseOn=s.pulse; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
   pulsebtn.className=s.pulse?'on':'';
-  const on=(s.pperiod*s.output/100);
+  const on=(s.pnow*s.output/100);
   pulsestat.textContent=s.pulse?(s.output>0&&s.output<100?
-    on.toFixed(1)+'s on / '+(s.pperiod-on).toFixed(1)+'s off':
+    on.toFixed(1)+'s on / '+(s.pnow-on).toFixed(1)+'s off'+
+      (s.automatic?' (auto '+s.pnow+'s cycle)':''):
     (s.output?'continuous':'off')):'';
   cal.textContent=s.cal&&s.cal<5?'Cancel':'Calibrate';
   cal.className=s.cal&&s.cal<5?'on':'';
@@ -581,7 +589,7 @@ async function tick(){
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
-    lookahead.value=s.lookahead;pperiod.value=s.pperiod;}
+    lookahead.value=s.lookahead;pperiod.value=s.pperiod;pminon.value=s.pminon;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   record(s.pm25,s.output,s.haze,s.setpoint);
   draw();
@@ -598,15 +606,26 @@ int calLeft() {
   return 0;
 }
 
+// In automatic the duty already tracks predicted PM2.5, because duty is the
+// controller's demand. The period has to adapt too: at 5% demand a fixed 10s
+// cycle asks for a half-second burst, which a hazer cannot deliver. Stretch the
+// cycle instead so every burst is at least pulseMinOn long. Manual keeps the
+// period the user dialled in.
+int pulsePeriodNow() {
+  if (!cfg.automatic || output <= 0) return cfg.pulsePeriod;
+  int per = (cfg.pulseMinOn * 100 + output - 1) / output;  // round up
+  return constrain(per, 5, 60);
+}
+
 // What is actually on the wire right now, pulsing included.
 uint8_t hazeLevel() {
   if (cfg.pulseMode && !cfg.stopped && !purging() && !calibrating())
-    return dutyLevel(millis(), output, cfg.pulsePeriod, cfg.pulseLevel);
+    return dutyLevel(millis(), output, pulsePeriodNow(), cfg.pulseLevel);
   return output;
 }
 
 void handleState() {
-  char buf[860];
+  char buf[900];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
@@ -614,7 +633,8 @@ void handleState() {
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
-           "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"sensorOk\":%s}",
+           "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
+           "\"pminon\":%d,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -627,7 +647,8 @@ void handleState() {
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.lookahead, pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
-           cfg.calPulse, calLeft(), hazeLevel(), sensorOk ? "true" : "false");
+           cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
+           cfg.pulseMinOn, sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -647,6 +668,8 @@ void handleSet() {
   }
   if (server.hasArg("stop")) cfg.stopped = server.arg("stop").toInt();
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
+  if (server.hasArg("pminon"))
+    cfg.pulseMinOn = constrain(server.arg("pminon").toInt(), 1, 10);
   if (server.hasArg("calpulse"))
     cfg.calPulse = constrain(server.arg("calpulse").toInt(), 30, 600);
   if (server.hasArg("pperiod"))
@@ -754,6 +777,20 @@ void loop() {
 
   if (now - lastControl >= 1000) {
     lastControl = now;
+
+    // Trend and prediction are readouts as much as control inputs, so they must
+    // update in every mode. Computing them only on the automatic path left both
+    // stuck at zero in manual, purge and calibration.
+    if (everRead && sensorOk) {
+      pmHist[pmIdx] = data.pm25_env;
+      pmIdx = (pmIdx + 1) % SLOPE_WIN;
+      if (pmCount < SLOPE_WIN) pmCount++;
+      pmSlope = pmCount < 5 ? 0
+                            : slopeOf(pmHist[(pmIdx - 1 + SLOPE_WIN) % SLOPE_WIN],
+                                      pmHist[(pmIdx - pmCount + SLOPE_WIN) % SLOPE_WIN],
+                                      pmCount);
+      predicted = predict(data.pm25_env, pmSlope, cfg.lookahead);
+    }
     if (cfg.stopped) {
       if (calibrating()) purgeUntil = 0;
       calState = CAL_OFF;
@@ -774,14 +811,6 @@ void loop() {
     } else if (!everRead || !sensorOk) {
       target = 0;  // fail safe: never keep hazing on a stale reading
     } else {
-      pmHist[pmIdx] = data.pm25_env;
-      pmIdx = (pmIdx + 1) % SLOPE_WIN;
-      if (pmCount < SLOPE_WIN) pmCount++;
-      pmSlope = pmCount < 5 ? 0
-                            : slopeOf(pmHist[(pmIdx - 1 + SLOPE_WIN) % SLOPE_WIN],
-                                      pmHist[(pmIdx - pmCount + SLOPE_WIN) % SLOPE_WIN],
-                                      pmCount);
-      predicted = predict(data.pm25_env, pmSlope, cfg.lookahead);
       target = computeOutput(cfg.setpoint, predicted, cfg.deadband, cfg.gain);
     }
     if (!purging() && !cfg.stopped && !calibrating())
