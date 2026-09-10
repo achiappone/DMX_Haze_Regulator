@@ -339,7 +339,8 @@ canvas{width:100%;height:300px;display:block;background:#1c1c1c;border-radius:8p
 #win,#pdur{width:auto;margin:0 0 12px}
 details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
-.row{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
+#savebtn{margin-left:auto}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
 </style>
@@ -371,7 +372,8 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
 <button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button>
 <select id=pdur><option value=30>30s</option><option value=60 selected>1 min</option>
-<option value=120>2 min</option><option value=300>5 min</option></select></div>
+<option value=120>2 min</option><option value=300>5 min</option></select>
+<button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)">
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
@@ -391,8 +393,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
 <option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
 <label>DMX start address</label>
-<div class=row><input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
-<button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
+<input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
 </details>
 <script>
 let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false;
