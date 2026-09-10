@@ -17,6 +17,7 @@
 #define DMX_EN_PIN 16
 #define DMX_UART UART_NUM_1
 #define DMX_PACKET_SIZE 513  // start code + 512 slots
+#define SENSOR_POLL_MS 250   // faster than the sensor's ~1s frame rate
 #define SENSOR_STALE_MS 5000
 #define DMX_INTERVAL_MS 30  // ~33Hz; full 513-slot packet takes ~23ms
 
@@ -38,7 +39,7 @@ struct {
 PM25_AQI_Data data;
 bool sensorOk = false, everRead = false;
 uint8_t output = 0, target = 0;
-unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0;
+unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0, lastControl = 0;
 
 // DMX512 straight onto the ESP32's UART: 250kbaud 8N2, a >=92us break, a
 // >=12us mark-after-break, then the slots. That is the entire protocol for a
@@ -249,20 +250,25 @@ void loop() {
   server.handleClient();
   unsigned long now = millis();
 
-  if (now - lastRead >= 1000) {
+  // The PMSA003I emits a frame about once a second on its own schedule, so a
+  // failed read is routine, not a fault. Poll faster than that and judge health
+  // only by how long it has been since a *good* read.
+  if (now - lastRead >= SENSOR_POLL_MS) {
     lastRead = now;
-    if (!sensorOk) {
-      sensorOk = aqi.begin_I2C(&Wire);
-    } else if (aqi.read(&data)) {
+    if (aqi.read(&data)) {
       everRead = true;
       lastGoodRead = now;
-    } else {
-      sensorOk = false;  // dropped off the bus; re-inits on the next tick
+    } else if (now - lastGoodRead > SENSOR_STALE_MS) {
+      aqi.begin_I2C(&Wire);  // genuinely gone; try to bring it back
     }
+  }
+  sensorOk = (now - lastGoodRead <= SENSOR_STALE_MS);
 
+  if (now - lastControl >= 1000) {
+    lastControl = now;
     if (!cfg.automatic) {
       target = cfg.manual;
-    } else if (!everRead || now - lastGoodRead > SENSOR_STALE_MS) {
+    } else if (!everRead || !sensorOk) {
       target = 0;  // fail safe: never keep hazing on a stale reading
     } else {
       target = computeOutput(cfg.setpoint, data.pm25_env, cfg.deadband, cfg.gain);
@@ -270,6 +276,8 @@ void loop() {
     output = applySlew(output, target, cfg.slew);
   }
 
+  // Unconditional: frames keep going out at zero as well, so a receiver never
+  // sees signal loss just because the haze is off.
   if (now - lastDmx >= DMX_INTERVAL_MS) {
     lastDmx = now;
     dmxData[0] = 0;                                   // DMX start code
