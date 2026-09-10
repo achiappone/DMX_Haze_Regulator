@@ -45,6 +45,25 @@ the ESP32 and a hazer on stage power has nowhere to go but through this.
 
 XLR out is the male connector: pin 1 ground, pin 2 cold, pin 3 hot.
 
+## Fixture - Chauvet Amhaze Stadium 2X IP
+
+One 2-channel personality. Set the machine's start address to match `dmxaddr`
+in the web UI (highest usable start address is 511).
+
+| Ch | Function    | 000-010     | 011-255            |
+|----|-------------|-------------|--------------------|
+| 1  | Fan Speed   | no function | 1-100% slow..fast  |
+| 2  | Haze Output | no function | 1-100% thin..heavy |
+
+Note the order: **fan is channel 1, haze is channel 2.**
+
+0-10 is a dead band, not "off by a little" - so `toDmx()` maps an internal
+level of 0 to DMX 0 and 1-255 onto 11-255. Without it the bottom 4% of the
+control range does nothing.
+
+Source: Amhaze Stadium 2X IP User Manual Rev. 5, "DMX Channel Assignments and
+Values".
+
 **Avoid GPIO33-37** - wired to the module's 8MB octal PSRAM. GPIO26-32 are flash.
 
 ## Build

@@ -31,7 +31,8 @@ struct {
   int deadband = 10;     // no output until this far below setpoint
   float gain = 2.0f;     // output counts per ug/m3 of error
   int slew = 8;          // max output change per second
-  int dmxAddress = 1;    // DMX channel driving haze level
+  int fan = 128;         // fan speed, independent of haze regulation
+  int dmxAddress = 1;    // start address; +0 = fan, +1 = haze
 } cfg;
 
 PM25_AQI_Data data;
@@ -67,6 +68,14 @@ void dmxSend() {
   uart_write_bytes(DMX_UART, dmxData, DMX_PACKET_SIZE);
 }
 
+// Amhaze Stadium 2X IP treats DMX 0-10 as "no function" on both channels, so a
+// raw level wastes the bottom 4% of the range. 0 stays off; 1-255 maps onto the
+// live band 11-255.
+uint8_t toDmx(uint8_t level) {
+  if (level == 0) return 0;
+  return 11 + (uint16_t)(level - 1) * 244 / 254;
+}
+
 // Proportional with deadband. Pure, so selfTest() can check it.
 uint8_t computeOutput(int setpoint, int pm25, int deadband, float gain) {
   int err = setpoint - pm25;
@@ -94,6 +103,10 @@ void selfTest() {
   assert(applySlew(255, 0, 8) == 247);              // ramps down
   assert(applySlew(100, 102, 8) == 102);            // small step lands exactly
   assert(applySlew(0, 0, 8) == 0);
+  assert(toDmx(0) == 0);      // off stays off
+  assert(toDmx(1) == 11);     // lowest live value, skips the dead band
+  assert(toDmx(255) == 255);  // full
+  assert(toDmx(128) == 133);  // midpoint lands inside the live band
   Serial.println("selfTest ok");
 }
 
@@ -121,7 +134,8 @@ button.on{background:#4a9;color:#000}
 <div class=c><span>PM10</span><b id=pm100>-</b></div>
 <div class=c><span>AQI US</span><b id=aqi>-</b></div>
 <div class=c><span>0.3um count</span><b id=c03>-</b></div>
-<div class=c><span>DMX out</span><b id=out>-</b></div>
+<div class=c><span>Level</span><b id=out>-</b></div>
+<div class=c><span>DMX ch2 haze</span><b id=dmxh>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
@@ -131,7 +145,8 @@ button.on{background:#4a9;color:#000}
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
 <label>Slew limit (counts/sec) <span id=vsl></span></label><input type=range id=slew min=1 max=255 oninput="post('slew',this.value)">
-<label>DMX address</label><input type=number id=dmxaddr min=1 max=512 onchange="post('dmxaddr',this.value)">
+<label>Fan speed (ch1) <span id=vfan></span></label><input type=range id=fan min=0 max=255 oninput="post('fan',this.value)">
+<label>DMX start address (ch1 fan, ch2 haze)</label><input type=number id=dmxaddr min=1 max=511 onchange="post('dmxaddr',this.value)">
 <script>
 let touching=0;
 document.querySelectorAll('input[type=range]').forEach(e=>{
@@ -141,6 +156,7 @@ async function tick(){
   let s=await(await fetch('/api/state')).json();
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
   aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output;
+  dmxh.textContent=s.dmxhaze;
   obar.style.width=(s.output/255*100)+'%';
   tmark.style.left=(s.target/255*100)+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
@@ -149,26 +165,27 @@ async function tick(){
     (s.pm25>=990?'sensor near saturation - readings unreliable':'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
+  vfan.textContent=s.fan;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
-    deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;}
+    deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
 }
 tick();setInterval(tick,1000);
 </script>)HTML";
 
 void handleState() {
-  char buf[400];
+  char buf[440];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
-           "\"dmxaddr\":%d,\"sensorOk\":%s}",
+           "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
            cfg.automatic ? "true" : "false", cfg.manual, cfg.setpoint,
-           cfg.deadband, cfg.gain, cfg.slew, cfg.dmxAddress,
-           sensorOk ? "true" : "false");
+           cfg.deadband, cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
+           toDmx(output), sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -179,10 +196,12 @@ void handleSet() {
   if (server.hasArg("deadband")) cfg.deadband = constrain(server.arg("deadband").toInt(), 0, 100);
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
   if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 255);
+  if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 255);
   if (server.hasArg("dmxaddr")) {
-    int a = constrain(server.arg("dmxaddr").toInt(), 1, 512);
+    int a = constrain(server.arg("dmxaddr").toInt(), 1, 511);  // 2ch personality
     if (a != cfg.dmxAddress) {
-      dmxData[cfg.dmxAddress] = 0;  // release the old channel
+      dmxData[cfg.dmxAddress] = 0;  // release both old channels
+      dmxData[cfg.dmxAddress + 1] = 0;
       cfg.dmxAddress = a;
     }
   }
@@ -253,8 +272,9 @@ void loop() {
 
   if (now - lastDmx >= DMX_INTERVAL_MS) {
     lastDmx = now;
-    dmxData[0] = 0;  // DMX start code
-    dmxData[cfg.dmxAddress] = output;
+    dmxData[0] = 0;                                   // DMX start code
+    dmxData[cfg.dmxAddress] = toDmx(cfg.fan);         // ch1 fan speed
+    dmxData[cfg.dmxAddress + 1] = toDmx(output);      // ch2 haze output
     dmxSend();
   }
 }
