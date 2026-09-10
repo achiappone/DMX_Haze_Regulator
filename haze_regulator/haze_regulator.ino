@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <assert.h>
+#include <string.h>
 #include <driver/uart.h>
 #include "secrets.h"
 
@@ -25,15 +26,31 @@ Adafruit_PM25AQI aqi;
 WebServer server(80);
 uint8_t dmxData[DMX_PACKET_SIZE];
 
+// Channel layout differs per machine. Offsets are from the start address; -1
+// means the fixture has no such channel. Both machines use the same 011-255
+// live band with 000-010 dead, so toDmx() is shared.
+struct Fixture {
+  const char *name;
+  uint8_t chans;
+  int8_t fanOff;
+  int8_t hazeOff;
+};
+const Fixture FIXTURES[] = {
+    {"Amhaze Stadium 2X IP", 2, 0, 1},  // ch1 fan, ch2 haze
+    {"Hurricane Haze 1DX", 1, -1, 0},   // ch1 haze only, no fan
+};
+#define FIXTURE_COUNT (sizeof(FIXTURES) / sizeof(FIXTURES[0]))
+
 struct {
   bool automatic = true;
-  uint8_t manual = 0;
+  uint8_t manual = 0;    // 0-100%
   int setpoint = 150;    // target PM2.5 ug/m3
   int deadband = 10;     // no output until this far below setpoint
-  float gain = 2.0f;     // output counts per ug/m3 of error
-  int slew = 8;          // max output change per second
-  int fan = 128;         // fan speed, independent of haze regulation
-  int dmxAddress = 1;    // start address; +0 = fan, +1 = haze
+  float gain = 1.0f;     // output % per ug/m3 of error
+  int slew = 3;          // max % change per second
+  int fan = 50;          // 0-100%, independent of haze regulation
+  int dmxAddress = 1;    // start address; channel layout depends on fixture
+  int fixture = 0;       // index into FIXTURES
 } cfg;
 
 PM25_AQI_Data data;
@@ -69,20 +86,23 @@ void dmxSend() {
   uart_write_bytes(DMX_UART, dmxData, DMX_PACKET_SIZE);
 }
 
-// Amhaze Stadium 2X IP treats DMX 0-10 as "no function" on both channels, so a
-// raw level wastes the bottom 4% of the range. 0 stays off; 1-255 maps onto the
-// live band 11-255.
-uint8_t toDmx(uint8_t level) {
-  if (level == 0) return 0;
-  return 11 + (uint16_t)(level - 1) * 244 / 254;
+// The Amhaze documents both channels as "1-100%" spread over DMX 011-255, with
+// 000-010 a dead "no function" band. Taking percent in means the number on the
+// UI is the same number the machine reports.
+uint8_t toDmx(uint8_t pct) {
+  if (pct == 0) return 0;  // off is off, not "lowest live value"
+  return 11 + (uint16_t)(pct - 1) * 244 / 99;
 }
+
+// A fixture occupying n channels cannot start later than 513-n.
+int maxAddress(uint8_t chans) { return DMX_PACKET_SIZE - chans; }
 
 // Proportional with deadband. Pure, so selfTest() can check it.
 uint8_t computeOutput(int setpoint, int pm25, int deadband, float gain) {
   int err = setpoint - pm25;
   if (err <= deadband) return 0;
   long out = lroundf(gain * (err - deadband));
-  return out > 255 ? 255 : (uint8_t)out;
+  return out > 100 ? 100 : (uint8_t)out;
 }
 
 // Rate-limits output movement. Doubles as the fix for two problems: haze takes
@@ -96,18 +116,20 @@ uint8_t applySlew(uint8_t current, uint8_t target, int maxStep) {
 }
 
 void selfTest() {
-  assert(computeOutput(150, 200, 10, 2.0f) == 0);   // too hazy -> off
-  assert(computeOutput(150, 150, 10, 2.0f) == 0);   // at target -> off
-  assert(computeOutput(150, 130, 10, 2.0f) == 20);  // err 20, less deadband, x2
-  assert(computeOutput(150, 0, 10, 2.0f) == 255);   // clamps
-  assert(applySlew(0, 255, 8) == 8);                // ramps up, no blast
-  assert(applySlew(255, 0, 8) == 247);              // ramps down
-  assert(applySlew(100, 102, 8) == 102);            // small step lands exactly
-  assert(applySlew(0, 0, 8) == 0);
+  assert(computeOutput(150, 200, 10, 1.0f) == 0);   // too hazy -> off
+  assert(computeOutput(150, 150, 10, 1.0f) == 0);   // at target -> off
+  assert(computeOutput(150, 130, 10, 1.0f) == 10);  // err 20, less deadband
+  assert(computeOutput(150, 0, 10, 1.0f) == 100);   // clamps at 100%
+  assert(applySlew(0, 100, 3) == 3);                // ramps up, no blast
+  assert(applySlew(100, 0, 3) == 97);               // ramps down
+  assert(applySlew(40, 41, 3) == 41);               // small step lands exactly
+  assert(applySlew(0, 0, 3) == 0);
   assert(toDmx(0) == 0);      // off stays off
-  assert(toDmx(1) == 11);     // lowest live value, skips the dead band
-  assert(toDmx(255) == 255);  // full
-  assert(toDmx(128) == 133);  // midpoint lands inside the live band
+  assert(toDmx(1) == 11);     // 1% = lowest live value, skips the dead band
+  assert(toDmx(100) == 255);  // 100%
+  assert(toDmx(50) == 131);   // 50% lands mid-band
+  assert(maxAddress(2) == 511);  // Amhaze, 2ch
+  assert(maxAddress(1) == 512);  // Hurricane Haze 1DX, 1ch
   Serial.println("selfTest ok");
 }
 
@@ -123,7 +145,8 @@ h1{font-size:17px;margin:0 0 12px}
 .bar u{position:absolute;top:0;height:100%;width:2px;background:#fff;opacity:.6}
 label{display:block;margin:10px 0 2px;color:#999;font-size:12px}
 input[type=range]{width:100%}
-input[type=number]{background:#1c1c1c;color:#eee;border:1px solid #333;border-radius:6px;padding:6px;width:80px;font:inherit}
+input[type=number],select{background:#1c1c1c;color:#eee;border:1px solid #333;border-radius:6px;padding:6px;font:inherit}
+input[type=number]{width:80px}select{width:100%;margin-bottom:4px}
 button{background:#333;color:#eee;border:0;border-radius:6px;padding:8px 14px;font:inherit}
 button.on{background:#4a9;color:#000}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
@@ -135,19 +158,22 @@ button.on{background:#4a9;color:#000}
 <div class=c><span>PM10</span><b id=pm100>-</b></div>
 <div class=c><span>AQI US</span><b id=aqi>-</b></div>
 <div class=c><span>0.3um count</span><b id=c03>-</b></div>
-<div class=c><span>Level</span><b id=out>-</b></div>
-<div class=c><span>DMX ch2 haze</span><b id=dmxh>-</b></div>
+<div class=c><span>Haze output</span><b id=out>-</b></div>
+<div class=c><span>DMX haze byte</span><b id=dmxh>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
 <button id=mode onclick="post('automatic',this.dataset.v==1?0:1)">-</button>
-<label>Manual level <span id=vman></span></label><input type=range id=manual min=0 max=255 oninput="post('manual',this.value)">
+<label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)">
 <label>Setpoint PM2.5 <span id=vsp></span></label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
-<label>Slew limit (counts/sec) <span id=vsl></span></label><input type=range id=slew min=1 max=255 oninput="post('slew',this.value)">
-<label>Fan speed (ch1) <span id=vfan></span></label><input type=range id=fan min=0 max=255 oninput="post('fan',this.value)">
-<label>DMX start address (ch1 fan, ch2 haze)</label><input type=number id=dmxaddr min=1 max=511 onchange="post('dmxaddr',this.value)">
+<label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
+<label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
+<option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
+<option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
+<div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
+<label>DMX start address</label><input type=number id=dmxaddr min=1 max=511 onchange="post('dmxaddr',this.value)">
 <script>
 let touching=0;
 document.querySelectorAll('input[type=range]').forEach(e=>{
@@ -156,17 +182,19 @@ function post(k,v){fetch('/api/set?'+k+'='+v)}
 async function tick(){
   let s=await(await fetch('/api/state')).json();
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
-  aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output;
+  aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
   dmxh.textContent=s.dmxhaze;
-  obar.style.width=(s.output/255*100)+'%';
-  tmark.style.left=(s.target/255*100)+'%';
+  obar.style.width=s.output+'%';
+  tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
   mode.className=s.automatic?'on':''; mode.dataset.v=s.automatic?1:0;
   warn.textContent=!s.sensorOk?'SENSOR LOST - output ramping to zero':
     (s.pm25>=990?'sensor near saturation - readings unreliable':'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
-  vfan.textContent=s.fan;
+  vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
+  dmxaddr.max=s.maxaddr;
+  if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
@@ -180,32 +208,46 @@ void handleState() {
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
-           "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"sensorOk\":%s}",
+           "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
            cfg.automatic ? "true" : "false", cfg.manual, cfg.setpoint,
            cfg.deadband, cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
-           toDmx(output), sensorOk ? "true" : "false");
+           toDmx(output), cfg.fixture,
+           FIXTURES[cfg.fixture].fanOff >= 0 ? "true" : "false",
+           maxAddress(FIXTURES[cfg.fixture].chans),
+           sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
 void handleSet() {
   if (server.hasArg("automatic")) cfg.automatic = server.arg("automatic").toInt();
-  if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 255);
+  if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
   if (server.hasArg("setpoint")) cfg.setpoint = constrain(server.arg("setpoint").toInt(), 0, 1000);
   if (server.hasArg("deadband")) cfg.deadband = constrain(server.arg("deadband").toInt(), 0, 100);
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
-  if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 255);
-  if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 255);
-  if (server.hasArg("dmxaddr")) {
-    int a = constrain(server.arg("dmxaddr").toInt(), 1, 511);  // 2ch personality
-    if (a != cfg.dmxAddress) {
-      dmxData[cfg.dmxAddress] = 0;  // release both old channels
-      dmxData[cfg.dmxAddress + 1] = 0;
-      cfg.dmxAddress = a;
+  if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
+  if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 100);
+  if (server.hasArg("fixture")) {
+    int f = constrain(server.arg("fixture").toInt(), 0, (int)FIXTURE_COUNT - 1);
+    if (f != cfg.fixture) {
+      cfg.fixture = f;
+      memset(dmxData + 1, 0, DMX_PACKET_SIZE - 1);  // release old channels
     }
   }
+  if (server.hasArg("dmxaddr")) {
+    int a = constrain(server.arg("dmxaddr").toInt(), 1,
+                      maxAddress(FIXTURES[cfg.fixture].chans));
+    if (a != cfg.dmxAddress) {
+      cfg.dmxAddress = a;
+      memset(dmxData + 1, 0, DMX_PACKET_SIZE - 1);
+    }
+  }
+  // A fixture switch can leave the address past the new limit.
+  cfg.dmxAddress = constrain(cfg.dmxAddress, 1,
+                             maxAddress(FIXTURES[cfg.fixture].chans));
   server.send(200, "text/plain", "ok");
 }
 
@@ -280,9 +322,10 @@ void loop() {
   // sees signal loss just because the haze is off.
   if (now - lastDmx >= DMX_INTERVAL_MS) {
     lastDmx = now;
-    dmxData[0] = 0;                                   // DMX start code
-    dmxData[cfg.dmxAddress] = toDmx(cfg.fan);         // ch1 fan speed
-    dmxData[cfg.dmxAddress + 1] = toDmx(output);      // ch2 haze output
+    const Fixture &f = FIXTURES[cfg.fixture];
+    dmxData[0] = 0;  // DMX start code
+    if (f.fanOff >= 0) dmxData[cfg.dmxAddress + f.fanOff] = toDmx(cfg.fan);
+    dmxData[cfg.dmxAddress + f.hazeOff] = toDmx(output);
     dmxSend();
   }
 }

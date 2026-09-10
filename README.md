@@ -45,10 +45,11 @@ the ESP32 and a hazer on stage power has nowhere to go but through this.
 
 XLR out is the male connector: pin 1 ground, pin 2 cold, pin 3 hot.
 
-## Fixture - Chauvet Amhaze Stadium 2X IP
+## Fixtures
 
-One 2-channel personality. Set the machine's start address to match `dmxaddr`
-in the web UI (highest usable start address is 511).
+Selectable in the web UI. Set the machine's start address to match `dmxaddr`.
+
+**Chauvet Amhaze Stadium 2X IP** - 2 channels, max start address 511
 
 | Ch | Function    | 000-010     | 011-255            |
 |----|-------------|-------------|--------------------|
@@ -57,12 +58,22 @@ in the web UI (highest usable start address is 511).
 
 Note the order: **fan is channel 1, haze is channel 2.**
 
-0-10 is a dead band, not "off by a little" - so `toDmx()` maps an internal
-level of 0 to DMX 0 and 1-255 onto 11-255. Without it the bottom 4% of the
-control range does nothing.
+**Chauvet Hurricane Haze 1DX** - 1 channel, max start address 512
 
-Source: Amhaze Stadium 2X IP User Manual Rev. 5, "DMX Channel Assignments and
-Values".
+| Ch | Function    | 000-010     | 011-255           |
+|----|-------------|-------------|-------------------|
+| 1  | Haze Volume | no function | 1-100% low..high  |
+
+No fan channel; the fan slider hides when this profile is selected. Needs
+2 minutes to heat up before it will output.
+
+Both machines share the same dead band: 000-010 does nothing, and 011-255 is
+1-100%. Control values are therefore percent throughout, and `toDmx()` maps
+0% to DMX 0 and 1-100% onto 11-255, so the number in the UI is the number the
+machine reports. Without it the bottom 4% of travel would be a silent no-op.
+
+Sources: Amhaze Stadium 2X IP User Manual Rev. 5 and Hurricane Haze 1DX User
+Manual Rev. 3, "DMX Values".
 
 **Avoid GPIO33-37** - wired to the module's 8MB octal PSRAM. GPIO26-32 are flash.
 
