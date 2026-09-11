@@ -32,7 +32,8 @@
 #define NORESP_PCT 10      // below this no measurable rise is expected anyway
 #define NORESP_WIN_S 90    // commanded this long before judging
 #define NORESP_RISE 15     // ug/m3 that counts as the machine responding
-#define SAT_PM 990        // PMSA003I tops out near 1000; above this it is blind
+#define SAT_PM 990        // PMSA003I mass tops out near 1000
+#define SAT_COUNT 60000   // 0.3um count field is 16-bit and saturates near here
 #define SAT_PURGE_MIN_MS 15000   // first response to saturation
 #define SAT_PURGE_MAX_MS 120000
 #define DMX_INTERVAL_MS 30  // ~33Hz; full 513-slot packet takes ~23ms
@@ -303,6 +304,16 @@ bool riseLockNext(bool cur, float slope, int cut) {
   return cur;  // between the thresholds: hold whatever we were doing
 }
 
+// Saturation has to be judged on whichever signal the loop is actually using.
+// The mass reading pegs at about 1000 ug/m3 in any real haze, but the 0.3um
+// count is still climbing freely there - treating a pegged mass reading as
+// blindness while regulating on counts made auto-purge fire forever and hold
+// output at zero, so the room could never reach target.
+bool sensorSaturated() {
+  if (!everRead) return false;
+  return cfg.source ? data.particles_03um >= SAT_COUNT : data.pm25_env >= SAT_PM;
+}
+
 // The signal the loop regulates on. PM2.5 mass is reported in whole ug/m3, so
 // below about 5 it is quantised into uselessness - clean air reads 0 or 1. The
 // 0.3um count reads in the thousands over the same span, which is where the
@@ -441,7 +452,7 @@ void runCalibration(unsigned long now, int pm) {
       if (!calDead && pm > trig) calDead = el < 1 ? 1 : el;
       // Stop early if the sensor nears its ~1000 ug/m3 ceiling: a saturated
       // reading flattens the peak and would understate the rise rate.
-      if (el >= (unsigned long)cfg.calPulse || pm >= 900) {
+      if (el >= (unsigned long)cfg.calPulse || sensorSaturated()) {
         calPulseUsed = el < 1 ? 1 : el;
         calT0 = now;
         calState = CAL_DECAY;
@@ -909,7 +920,7 @@ async function tick(){
     !s.sensorOk?'SENSOR LOST - output ramping to zero':
     s.riselock?'RISING FAST - output held off until it levels out':
     s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
-    (s.pm25>=990?(s.purge?'SENSOR SATURATED - purging to clear':
+    ((s.source?s.c03>=60000:s.pm25>=990)?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
   vman.textContent=s.manual; vsp.textContent=ug(s.setpoint);
   vdb.textContent=ug(s.deadband);
@@ -995,7 +1006,7 @@ uint8_t ledLevel(uint8_t pct) {
 void updateLed() {
   // Red beats green: a pegged sensor means the regulator is blind, which is
   // worth seeing across the room whatever the output happens to be.
-  bool sat = everRead && sensorOk && data.pm25_env >= SAT_PM;
+  bool sat = sensorOk && sensorSaturated();
   int16_t g = sat ? -1 : ledLevel(hazeLevel());
   if (g == ledGreen) return;  // written only on change: this masks interrupts
   ledGreen = g;
@@ -1546,14 +1557,16 @@ void loop() {
     // and any output it commands is guesswork. Clear the air instead. Not during
     // calibration, which runs its own purge phase and aborts near the ceiling.
     if (cfg.autoPurge && !cfg.stopped && !calibrating() && everRead && sensorOk) {
-      if (data.pm25_env >= SAT_PM && !purging()) {
+      if (sensorSaturated() && !purging()) {
         // Start short. If it is still pegged after clearing, the room needs
         // more than a nudge, so each successive attempt doubles.
         purgeUntil = now + satPurgeMs;
-        logEvent("saturated at %u ug/m3, auto-purge %lus", data.pm25_env,
+        logEvent("%s saturated (%u), auto-purge %lus",
+                 cfg.source ? "count" : "pm2.5",
+                 cfg.source ? data.particles_03um : data.pm25_env,
                  satPurgeMs / 1000);
         satPurgeMs = min(satPurgeMs * 2, (unsigned long)SAT_PURGE_MAX_MS);
-      } else if (data.pm25_env < SAT_PM - 100) {
+      } else if (!sensorSaturated()) {
         satPurgeMs = SAT_PURGE_MIN_MS;  // clear of the ceiling: reset escalation
       }
     }
@@ -1604,8 +1617,7 @@ void loop() {
     // which, but knowing it is happening is the part that matters mid-show.
     // Saturation is excluded: a pegged sensor cannot show a rise either way.
     bool judging = output >= NORESP_PCT && !cfg.stopped && !purging() &&
-                   !calibrating() && everRead && sensorOk &&
-                   data.pm25_env < SAT_PM;
+                   !calibrating() && everRead && sensorOk && !sensorSaturated();
     if (!judging) {
       outSince = 0;
       if (noResponse && output < NORESP_PCT) noResponse = false;
