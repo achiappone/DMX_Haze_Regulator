@@ -1,3 +1,7 @@
 # WiFi credentials - copy secrets.h.example to secrets.h and fill in
 haze_regulator/secrets.h
 build/
+
+# WebStorm: share the run configurations, keep the per-user state out
+.idea/*
+!.idea/runConfigurations/

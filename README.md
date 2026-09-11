@@ -100,6 +100,9 @@ Manual Rev. 3, "DMX Values".
 
 Host, serial port and FQBN live in the `config` block of package.json.
 
+In WebStorm these also appear in the Run dropdown - "Firmware - OTA update over
+wifi" is the usual one - and in the npm tool window.
+
 The Setup section of the web page has a firmware picker that posts to the same
 endpoint, so a phone can update the board at the rig. Use `npm run bin` to get a
 .bin somewhere findable first - arduino-cli otherwise leaves it in a cache
