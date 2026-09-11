@@ -446,7 +446,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
 <canvas id=chart></canvas>
-<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze demand %</i><i style=color:#e9944490>actual on wire</i>
+<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze demand %</i><i style=color:#e99444>actual on wire (shaded)</i>
 <i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
 <select id=win onchange="setWin(this.value)">
 <option value=30>30 seconds</option><option value=60>1 minute</option><option value=300>5 minutes</option>
@@ -546,7 +546,7 @@ function draw(){
   const by=spy<MT+24?spy+3:spy-24;
   ctx.fillStyle='#000d';ctx.fillRect(ML+pw-tw-13,by,tw+11,23);
   ctx.fillStyle='#fff';ctx.fillText(lab,ML+pw-tw-7,by+16);
-  ctx.fillStyle='#e9944440';ctx.beginPath();ctx.moveTo(X(0),MT+ph);
+  ctx.fillStyle='#e9944466';ctx.beginPath();ctx.moveTo(X(0),MT+ph);
   for(let i=0;i<n;i++)ctx.lineTo(X(i),Ypc(H.act[i]));
   ctx.lineTo(X(n-1),MT+ph);ctx.closePath();ctx.fill();
   const line=(a,Y,col,lw)=>{ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
