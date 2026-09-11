@@ -453,7 +453,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
 <canvas id=chart></canvas>
-<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze demand %</i><i style=color:#e99444>actual on wire (shaded)</i>
+<div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#ffb069>haze demand % (dashed)</i><i style=color:#e99444>actual on wire (shaded)</i>
 <i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
 <div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
@@ -558,7 +558,11 @@ function draw(){
   const line=(a,Y,col,lw)=>{ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
     for(let i=0;i<n;i++){const y=Y(a[i]);i?ctx.lineTo(X(i),y):ctx.moveTo(X(i),y)}
     ctx.stroke();};
-  line(H.out,Ypc,'#e94',1.5);
+  // Demand is dashed so the solid actual-on-wire fill stays readable beneath it
+  // even when the two are identical, which they are whenever pulsing is off.
+  ctx.setLineDash([5,3]);
+  line(H.out,Ypc,'#ffb069',1.6);
+  ctx.setLineDash([]);
   line(H.pm,Ypm,'#4a9',2);
   ctx.font='11px system-ui';ctx.fillStyle='#777';
   ctx.fillText((H.dt>=60000?(H.dt/60000)+' min':(H.dt/1000)+'s')+' per point',ML,h-8);
