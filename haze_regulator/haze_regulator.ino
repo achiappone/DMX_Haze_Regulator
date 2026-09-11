@@ -26,6 +26,8 @@
 #define SLOPE_WIN 30       // seconds of PM history used for the trend
 #define SENSOR_POLL_MS 250   // faster than the sensor's ~1s frame rate
 #define SENSOR_STALE_MS 5000
+#define SAT_PM 990        // PMSA003I tops out near 1000; above this it is blind
+#define SAT_PURGE_MS 30000
 #define DMX_INTERVAL_MS 30  // ~33Hz; full 513-slot packet takes ~23ms
 
 Adafruit_PM25AQI aqi;
@@ -65,6 +67,7 @@ struct {
   int pulseLevel = 100;    // output % during the on part of the cycle
   int calPulse = 30;       // calibration pulse length, seconds
   int pulseMinOn = 2;      // auto mode: shortest burst worth firing, seconds
+  bool autoPurge = true;   // clear the air automatically when the sensor pegs
 } cfg;
 
 PM25_AQI_Data data;
@@ -308,6 +311,7 @@ void saveCfg() {
   prefs.putInt("plevel", cfg.pulseLevel);
   prefs.putInt("calpulse", cfg.calPulse);
   prefs.putInt("pminon", cfg.pulseMinOn);
+  prefs.putBool("autopurge", cfg.autoPurge);
 }
 
 void loadCfg() {
@@ -327,6 +331,7 @@ void loadCfg() {
   cfg.pulseLevel = prefs.getInt("plevel", cfg.pulseLevel);
   cfg.calPulse = prefs.getInt("calpulse", cfg.calPulse);
   cfg.pulseMinOn = prefs.getInt("pminon", cfg.pulseMinOn);
+  cfg.autoPurge = prefs.getBool("autopurge", cfg.autoPurge);
   // Clamp everything: stored bytes are not trustworthy input.
   cfg.fixture = constrain(cfg.fixture, 0, (int)FIXTURE_COUNT - 1);
   cfg.dmxAddress =
@@ -421,8 +426,10 @@ button.stop.armed{background:#e74c3c;box-shadow:0 0 0 2px #e74c3c55}
 #warn.halt{color:#e74c3c;font-weight:600}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
 canvas{width:100%;height:360px;display:block;background:#1c1c1c;border-radius:8px}
-#win,#pdur{width:auto;margin:0 0 12px}
-#csvbtn{margin:0 0 12px 8px}
+#win,#pdur{width:auto;margin:0}
+.grp{display:inline-flex;gap:6px;align-items:center;background:#1a1a1a;
+border:1px solid #2d2d2d;border-radius:9px;padding:5px 7px}
+.grp button{background:#2e2e2e}
 details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
@@ -448,18 +455,16 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <canvas id=chart></canvas>
 <div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#e94>haze demand %</i><i style=color:#e99444>actual on wire (shaded)</i>
 <i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
-<select id=win onchange="setWin(this.value)">
+<div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
+<button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
+<span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=30>30s</option><option value=60 selected>1 min</option>
+<option value=120>2 min</option><option value=300>5 min</option></select></span>
+<span class=grp><select id=win onchange="setWin(this.value)">
 <option value=30>30 seconds</option><option value=60>1 minute</option><option value=300>5 minutes</option>
 <option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
-<option value=86400>24 hours</option><option value=604800>7 days</option></select>
-<button id=csvbtn onclick="location='/api/csv?win='+winSec">Download CSV</button>
-<div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
-<button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
-<button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button>
-<select id=pdur><option value=30>30s</option><option value=60 selected>1 min</option>
-<option value=120>2 min</option><option value=300>5 min</option></select>
+<option value=86400>24 hours</option><option value=604800>7 days</option></select><button id=csvbtn onclick="location='/api/csv?win='+winSec">Download CSV</button></span>
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)">
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
@@ -474,6 +479,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
 <label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
+<div class=row><button id=apbtn onclick="post('autopurge',apOn?0:1)">Auto-purge on saturation</button></div>
 <div class=row><button id=pulsebtn onclick="post('pulse',pulseOn?0:1)">Pulse mode</button>
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)">
@@ -488,7 +494,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
 </details>
 <script>
-let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false;
+let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
 document.querySelectorAll('input[type=range]').forEach(e=>{
   e.onpointerdown=()=>touching=1; e.onpointerup=()=>touching=0;});
 // Coalesce changes into one request and refresh straight after, so a button
@@ -575,11 +581,13 @@ async function tick(){
   warn.className=stopped?'halt':'';
   warn.textContent=stopped?'OUTPUT STOPPED':
     !s.sensorOk?'SENSOR LOST - output ramping to zero':
-    (s.pm25>=990?'sensor near saturation - readings unreliable':'');
+    (s.pm25>=990?(s.purge?'SENSOR SATURATED - purging to clear':
+       'sensor near saturation - readings unreliable'):'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan; vla.textContent=s.lookahead;
-  s_cal=s.cal; pulseOn=s.pulse; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
+  s_cal=s.cal; pulseOn=s.pulse; apOn=s.autopurge;
+  apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
   pulsebtn.className=s.pulse?'on':'';
   const on=(s.pnow*s.output/100);
   pulsestat.textContent=s.pulse?(s.output>0&&s.output<100?
@@ -662,7 +670,7 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[900];
+  char buf[940];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
@@ -671,7 +679,7 @@ void handleState() {
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
-           "\"pminon\":%d,\"sensorOk\":%s}",
+           "\"pminon\":%d,\"autopurge\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -685,7 +693,8 @@ void handleState() {
            cfg.lookahead, pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
-           cfg.pulseMinOn, sensorOk ? "true" : "false");
+           cfg.pulseMinOn, cfg.autoPurge ? "true" : "false",
+           sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -794,6 +803,7 @@ void handleSet() {
   }
   if (server.hasArg("stop")) cfg.stopped = server.arg("stop").toInt();
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
+  if (server.hasArg("autopurge")) cfg.autoPurge = server.arg("autopurge").toInt();
   if (server.hasArg("pminon"))
     cfg.pulseMinOn = constrain(server.arg("pminon").toInt(), 1, 10);
   if (server.hasArg("calpulse"))
@@ -934,6 +944,13 @@ void loop() {
                                       pmCount);
       predicted = predict(data.pm25_env, pmSlope, cfg.lookahead);
     }
+    // A pegged sensor cannot report a trend, so the regulator is flying blind
+    // and any output it commands is guesswork. Clear the air instead. Not during
+    // calibration, which runs its own purge phase and aborts near the ceiling.
+    if (cfg.autoPurge && !cfg.stopped && !calibrating() && everRead && sensorOk &&
+        data.pm25_env >= SAT_PM && !purging())
+      purgeUntil = now + SAT_PURGE_MS;
+
     if (cfg.stopped) {
       if (calibrating()) purgeUntil = 0;
       calState = CAL_OFF;
