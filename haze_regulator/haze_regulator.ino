@@ -76,6 +76,9 @@ struct {
   int floorPct = 10;     // never command less than this when well below target
   int riseCut = 3;       // ug/m3/s climb that latches output off; 0 = disabled
   int integralTi = 300;  // integral time, seconds; 0 = proportional only
+  float riseRate = 0;    // signal units per second at 100% output, from calibration
+  int deadTime = 0;      // seconds from commanding output to seeing it
+  int dosePct = 100;     // how much of the computed deficit to commit, percent
   bool stopped = false;  // latched stop; survives reboot on purpose
   bool pulseMode = false;  // time-proportional output instead of continuous
   int pulsePeriod = 10;    // seconds per pulse cycle
@@ -294,6 +297,22 @@ float slopeOf(int newest, int oldest, int samples) {
 // than being late to start.
 int leadFor(float slope, int fall, int rise) { return slope < 0 ? fall : rise; }
 
+// Dead time means output commanded now is invisible for tens of seconds, so a
+// feedback loop keeps asking for more until the reading finally moves - by which
+// point far too much is already on its way. That is what produces a 300 reading
+// against a 150 target, and no amount of gain tuning removes it.
+//
+// So cap output at the most that could be useful: the rate that would exactly
+// close the remaining deficit over one dead time. Committing more than the
+// deficit guarantees overshoot regardless of what feedback decides afterwards.
+// Both constants come from calibration; without them the cap does nothing.
+uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
+  if (riseRate <= 0 || deadTime <= 0) return 100;  // uncalibrated: no opinion
+  if (gap <= 0) return 0;
+  float u = 100.0f * gap / (riseRate * deadTime) * (pct / 100.0f);
+  return u >= 100.0f ? 100 : (uint8_t)lroundf(u);
+}
+
 // Once levels are climbing quickly, the haze already in flight will keep them
 // climbing for tens of seconds. Adding more only buys overshoot, so latch output
 // off and hold it there until the rise actually stops. Latching matters: release
@@ -385,6 +404,9 @@ void calFinish() {
   // Integral time tracks the room's own decay constant: integrate no faster
   // than the process can actually respond, or the loop winds itself up.
   if (calTau > 0) cfg.integralTi = constrain(calTau, 30, 1800);
+  // Feed the dose limiter: these are exactly the numbers it needs.
+  cfg.riseRate = constrain(calRise, 0.0f, 500.0f);
+  cfg.deadTime = constrain(calDead, 0, 300);
   if (calRise > 0.01f) {
     // Lambda (IMC) tuning rather than Ziegler-Nichols. ZN assumes you can
     // afford to oscillate around setpoint; here you cannot, because haze
@@ -504,6 +526,9 @@ void saveCfg() {
   prefs.putInt("floor", cfg.floorPct);
   prefs.putInt("risecut", cfg.riseCut);
   prefs.putInt("ti", cfg.integralTi);
+  prefs.putFloat("rise", cfg.riseRate);
+  prefs.putInt("dead", cfg.deadTime);
+  prefs.putInt("dosepct", cfg.dosePct);
   prefs.putBool("stopped", cfg.stopped);
   prefs.putBool("pulse", cfg.pulseMode);
   prefs.putInt("pperiod", cfg.pulsePeriod);
@@ -531,6 +556,9 @@ void loadCfg() {
   cfg.floorPct = prefs.getInt("floor", cfg.floorPct);
   cfg.riseCut = prefs.getInt("risecut", cfg.riseCut);
   cfg.integralTi = prefs.getInt("ti", cfg.integralTi);
+  cfg.riseRate = prefs.getFloat("rise", cfg.riseRate);
+  cfg.deadTime = prefs.getInt("dead", cfg.deadTime);
+  cfg.dosePct = prefs.getInt("dosepct", cfg.dosePct);
   cfg.stopped = prefs.getBool("stopped", cfg.stopped);
   cfg.pulseMode = prefs.getBool("pulse", cfg.pulseMode);
   cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
@@ -556,6 +584,9 @@ void loadCfg() {
   cfg.floorPct = constrain(cfg.floorPct, 0, 50);
   cfg.riseCut = constrain(cfg.riseCut, 0, 50);
   cfg.integralTi = constrain(cfg.integralTi, 0, 1800);
+  cfg.riseRate = constrain(cfg.riseRate, 0.0f, 500.0f);
+  cfg.deadTime = constrain(cfg.deadTime, 0, 300);
+  cfg.dosePct = constrain(cfg.dosePct, 10, 200);
   cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
   cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
   cfg.calPulse = constrain(cfg.calPulse, 30, 600);
@@ -646,6 +677,12 @@ void selfTest() {
   assert(riseLockNext(true, -1.0f, 3) == false);     // falling again -> release
   assert(riseLockNext(true, 0.0f, 3) == false);      // stopped rising -> release
   assert(riseLockNext(true, 9.0f, 0) == false);      // disabled
+  // 150 deficit, 20 units/s at full, 20s dead time: 37.5% exactly closes it
+  assert(doseCap(150, 20.0f, 20, 100) == 38);
+  assert(doseCap(0, 20.0f, 20, 100) == 0);        // at target, commit nothing
+  assert(doseCap(1000, 20.0f, 20, 100) == 100);   // huge deficit, still capped
+  assert(doseCap(150, 0.0f, 20, 100) == 100);     // uncalibrated: no cap
+  assert(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
   float acc = 0;
   assert(computePI(200, 100, 10, 1.0f, 0, acc) == 90);   // Ti=0 is plain P
   assert(acc == 0.0f);
@@ -767,6 +804,8 @@ input:disabled{cursor:not-allowed}
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
+<label>Dose limit <span id=vdose></span>% of deficit <i style=color:#666>(needs calibration; caps overshoot)</i></label><input type=range id=dosepct min=10 max=200 step=5 oninput="post('dosepct',this.value)">
+<div class=leg><i id=doseinfo></i></div>
 <label>Integral time <span id=vti></span>s <i style=color:#666>(0 = proportional only)</i></label><input type=range id=ti min=0 max=1800 step=10 oninput="post('ti',this.value)">
 <label>Cut off above rise rate <span id=vrc></span> ug/m3/s <i style=color:#666>(0 = off)</i></label><input type=range id=risecut min=0 max=50 oninput="post('risecut',this.value)">
 <label>Minimum output when low <span id=vfloor></span>% <i style=color:#666>(anti-starve)</i></label><input type=range id=floor min=0 max=50 oninput="post('floor',this.value)">
@@ -928,7 +967,10 @@ async function tick(){
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
   vtau.textContent=s.tau; vtail.textContent=s.tail; vfloor.textContent=s.floor;
-  vrc.textContent=s.risecut; vti.textContent=s.ti;
+  vrc.textContent=s.risecut; vti.textContent=s.ti; vdose.textContent=s.dosepct;
+  doseinfo.textContent=s.rise>0&&s.dead>0
+    ?'measured '+s.rise.toFixed(1)+'/s at full output, '+s.dead+'s dead time'
+    :'not calibrated - dose limit inactive, run Calibrate';
   integ.textContent=s.integ.toFixed(1); vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
   s_cal=s.cal; pulseOn=s.pulse; apOn=s.autopurge;
   apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
@@ -959,7 +1001,7 @@ async function tick(){
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
     setpoint.value=s.setpoint;
     tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;risecut.value=s.risecut;
-    ti.value=s.ti;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
+    ti.value=s.ti;dosepct.value=s.dosepct;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
     pperiod.value=s.pperiod;pminon.value=s.pminon;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   draw();
@@ -1024,13 +1066,13 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[1440];
+  char buf[1560];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"c03\":%u,\"rssi\":%d,\"up\":%lu,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"source\":%d,\"ctrl\":%.2f,\"setpoint\":%.2f,\"deadband\":%.2f,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"risecut\":%d,\"riselock\":%s,\"ti\":%d,\"integ\":%.1f,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"risecut\":%d,\"riselock\":%s,\"ti\":%d,\"integ\":%.1f,\"rise\":%.2f,\"dead\":%d,\"dosepct\":%d,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
@@ -1048,7 +1090,8 @@ void handleState() {
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.leadFall, cfg.leadRise, cfg.filterTau, cfg.machineTail,
            cfg.floorPct, cfg.riseCut, riseLock ? "true" : "false",
-           cfg.integralTi, integ,
+           cfg.integralTi, integ, (double)cfg.riseRate, cfg.deadTime,
+           cfg.dosePct,
            time(nullptr) > 1700000000 ? "true" : "false",
            (int)lroundf(pmFilt), pkSes, (unsigned long)pkSesAt, pkAll,
            (unsigned long)pkAllBoot, (unsigned long)pkAllAt, pkOut,
@@ -1295,6 +1338,8 @@ void handleSet() {
       logEvent("clock set from browser");
     }
   }
+  if (server.hasArg("dosepct"))
+    cfg.dosePct = constrain(server.arg("dosepct").toInt(), 10, 200);
   if (server.hasArg("ti"))
     cfg.integralTi = constrain(server.arg("ti").toInt(), 0, 1800);
   if (server.hasArg("risecut"))
@@ -1604,6 +1649,12 @@ void loop() {
       if (pmFilt < cfg.setpoint - 3 * cfg.deadband && target < cfg.floorPct)
         target = cfg.floorPct;
       bool wasLock = riseLock;
+      // Applied after the floor: an anti-starvation minimum must not be able
+      // to overshoot a target that is already nearly reached.
+      uint8_t cap = doseCap(cfg.setpoint - pmFilt, cfg.riseRate, cfg.deadTime,
+                            cfg.dosePct);
+      if (target > cap) target = cap;
+
       riseLock = riseLockNext(riseLock, pmSlope, cfg.riseCut);
       if (riseLock != wasLock)
         logEvent(riseLock ? "rise lock on, climbing %+.1f/s" : "rise lock off",
