@@ -548,7 +548,7 @@ input:disabled{cursor:not-allowed}
 <option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
-<option value=86400>24 hours</option><option value=604800>7 days</option></select><button id=csvbtn onclick="location='/api/csv?win='+winSec">Download CSV</button></span>
+<option value=86400>24 hours</option><option value=604800>7 days</option></select><button id=csvbtn onclick="location='/api/csv?win='+winSec">Download CSV</button><button id=rstbtn onclick="if(confirm('Clear all stored chart history?'))fetch('/api/history?clear=1').then(loadHist)">Reset</button></span>
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
@@ -619,8 +619,7 @@ function draw(){
   // Position by real elapsed time, not by index. Spreading whatever points
   // exist across the full width made 30 minutes of data in a 24 hour window
   // look like a full day of history.
-  const spanMs=winSec*1000;
-  const X=i=>Math.max(ML,ML+pw-((n-1-i)*H.dt)/spanMs*pw);
+  const X=i=>Math.max(ML,ML+pw-(H.t[i]/10)/winSec*pw);
   const Ypm=v=>MT+ph-v/top*ph;
   const Ypc=v=>MT+ph-v/100*ph;
   peakLbl.textContent='peak '+Math.round(peak);
@@ -658,8 +657,10 @@ function draw(){
   ctx.setLineDash([]);
   line(H.pm,Ypm,'#4a9',2);
   ctx.font='11px system-ui';ctx.fillStyle='#777';
-  ctx.fillText((H.dt>=60000?(H.dt/60000)+' min':(H.dt/1000)+'s')+' per point'+
-    (winSec<=3600&&H.dt>=60000?' - fine detail still filling':''),ML,h-8);
+  const oldest=H.t[0]/10;
+  ctx.fillText('showing '+(oldest>=3600?(oldest/3600).toFixed(1)+' h':
+    oldest>=60?Math.round(oldest/60)+' min':Math.round(oldest)+' s')+
+    ' of '+n+' points',ML,h-8);
   ctx.textAlign='right';ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-8,12);
   ctx.textAlign='left';ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
 }
@@ -829,56 +830,91 @@ bool pickFine(int win) {
 // samples, and sending them all would be a megabyte of JSON to draw on a strip
 // a few hundred pixels wide.
 #define MAXPTS 420
-void handleHistory() {
-  int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
-  win = constrain(win, 30, 604800);
-  bool fine = pickFine(win);
-  Sample *buf = fine ? fineBuf : coarseBuf;
-  int cap = fine ? fineCap : coarseCap;
-  int n = fine ? fineN : coarseN;
-  int head = fine ? fineHead : coarseHead;
-  int perMs = fine ? HIST_FINE_MS : HIST_COARSE_MS;
+// Serve one merged series instead of picking a tier: minute averages for the
+// older part of the window, 2Hz detail for however recent a stretch the RAM
+// buffer still holds. Switching between tiers made the chart jump resolution
+// as the fast buffer filled after a reboot. Each point carries its own age, so
+// the two resolutions can sit side by side on the same axis.
+void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first) {
+  Sample *buf = coarse ? coarseBuf : fineBuf;
+  int cap = coarse ? coarseCap : fineCap;
+  int head = coarse ? coarseHead : fineHead;
+  int per = coarse ? HIST_COARSE_MS : HIST_FINE_MS;
+  int newest = (head - 1 + cap) % cap;
+  String chunk;
+  chunk.reserve(1200);
+  for (int k = from + (cnt - 1) * step; k >= from; k -= step) {
+    int idx = ((newest - k) % cap + cap) % cap;
+    long v;
+    if (field == 0) v = (long)k * per / 100;  // age in tenths of a second
+    else if (field == 1) v = buf[idx].pm;
+    else if (field == 2) v = buf[idx].out;
+    else v = buf[idx].act;
+    if (!first) chunk += ',';
+    first = false;
+    chunk += v;
+    if (chunk.length() > 1000) { server.sendContent(chunk); chunk = ""; }
+  }
+  if (chunk.length()) server.sendContent(chunk);
+}
 
-  int want = (int)((long)win * 1000 / perMs);
-  if (want > n) want = n;
-  if (!buf || want < 2) {
+void handleHistory() {
+  if (server.hasArg("clear")) {
+    fineN = fineHead = coarseN = coarseHead = 0;
+    cAccPm = cAccOut = cAccAct = 0;
+    cAccN = 0;
+    if (fsOk) LittleFS.remove(TREND_PATH);
+    logEvent("trend history cleared");
     server.send(200, "application/json", "{\"n\":0}");
     return;
   }
-  int step = (want + MAXPTS - 1) / MAXPTS;
-  int count = want / step;
-  int newest = (head - 1 + cap) % cap;
+  int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
+  win = constrain(win, 30, 604800);
+  long winMs = (long)win * 1000;
+
+  long fineMs = (long)fineN * HIST_FINE_MS;
+  if (fineMs > winMs) fineMs = winMs;
+  int fineWant = fineMs / HIST_FINE_MS;
+
+  int coarseSkip = fineMs / HIST_COARSE_MS;  // newest minutes overlap the fine part
+  int coarseWant = (winMs - fineMs) / HIST_COARSE_MS;
+  if (coarseWant > coarseN - coarseSkip) coarseWant = coarseN - coarseSkip;
+  if (coarseWant < 0) coarseWant = 0;
+
+  if (fineWant + coarseWant < 2) {
+    server.send(200, "application/json", "{\"n\":0}");
+    return;
+  }
+  // Budget points by how much of the axis each part covers, but always keep a
+  // little detail at the right-hand edge.
+  int budF = winMs ? (int)(fineMs * MAXPTS / winMs) : MAXPTS;
+  if (fineWant && budF < 40) budF = 40;
+  if (budF > MAXPTS) budF = MAXPTS;
+  int budC = MAXPTS - budF;
+  int stepF = fineWant && budF ? (fineWant + budF - 1) / budF : 1;
+  int stepC = coarseWant && budC ? (coarseWant + budC - 1) / budC : 1;
+  if (stepF < 1) stepF = 1;
+  if (stepC < 1) stepC = 1;
+  int nF = stepF ? fineWant / stepF : 0;
+  int nC = stepC ? coarseWant / stepC : 0;
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
-  char head_[96];
-  snprintf(head_, sizeof(head_), "{\"dt\":%d,\"n\":%d,\"sp\":%d,\"pm\":[",
-           perMs * step, count, cfg.setpoint);
-  server.sendContent(head_);
-
-  String chunk;
-  chunk.reserve(1200);
-  for (int f = 0; f < 3; f++) {  // pm, out, act - one pass each
-    if (f) server.sendContent(f == 1 ? "],\"out\":[" : "],\"act\":[");
-    chunk = "";
-    for (int i = count - 1; i >= 0; i--) {
-      int idx = ((newest - i * step) % cap + cap) % cap;
-      Sample &sm = buf[idx];
-      if (i != count - 1) chunk += ',';
-      chunk += (f == 0) ? sm.pm : (f == 1 ? sm.out : sm.act);
-      if (chunk.length() > 1000) {
-        server.sendContent(chunk);
-        chunk = "";
-      }
-    }
-    if (chunk.length()) server.sendContent(chunk);
+  char hd[80];
+  snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%d,\"t\":[", nF + nC, cfg.setpoint);
+  server.sendContent(hd);
+  for (int field = 0; field < 4; field++) {
+    if (field) server.sendContent(field == 1   ? "],\"pm\":["
+                                  : field == 2 ? "],\"out\":["
+                                               : "],\"act\":[");
+    bool first = true;
+    if (nC) emitRange(true, coarseSkip, nC, stepC, field, first);
+    if (nF) emitRange(false, 0, nF, stepF, field, first);
   }
   server.sendContent("]}");
   server.sendContent("");
 }
 
-// Full resolution, undecimated: the chart wants something drawable, an export
-// wants everything. No RTC on board, so time is expressed as seconds ago.
 void handleEvents() {
   if (server.hasArg("clear")) {
     if (fsOk) LittleFS.remove(EVT_PATH);
