@@ -27,6 +27,9 @@
 #define SLOPE_WIN 30       // seconds of PM history used for the trend
 #define SENSOR_POLL_MS 250   // faster than the sensor's ~1s frame rate
 #define SENSOR_STALE_MS 5000
+#define NORESP_PCT 10      // below this no measurable rise is expected anyway
+#define NORESP_WIN_S 90    // commanded this long before judging
+#define NORESP_RISE 15     // ug/m3 that counts as the machine responding
 #define SAT_PM 990        // PMSA003I tops out near 1000; above this it is blind
 #define SAT_PURGE_MIN_MS 15000   // first response to saturation
 #define SAT_PURGE_MAX_MS 120000
@@ -198,6 +201,9 @@ uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
 int predicted = 0;
+unsigned long outSince = 0;
+int pmAtOutStart = 0;
+bool noResponse = false;
 
 // Purge clears the air with the machine's own fan: haze off, fan wide open.
 // Overflow-safe compare, so it cannot latch on at the millis() rollover.
@@ -680,6 +686,7 @@ async function tick(){
   warn.className=stopped?'halt':'';
   warn.textContent=stopped?'OUTPUT STOPPED':
     !s.sensorOk?'SENSOR LOST - output ramping to zero':
+    s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
     (s.pm25>=990?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
@@ -769,7 +776,7 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[940];
+  char buf[980];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
@@ -778,7 +785,7 @@ void handleState() {
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
-           "\"pminon\":%d,\"autopurge\":%s,\"sensorOk\":%s}",
+           "\"pminon\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
@@ -793,7 +800,7 @@ void handleState() {
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.autoPurge ? "true" : "false",
-           sensorOk ? "true" : "false");
+           noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -1158,6 +1165,34 @@ void loop() {
     }
     if (!purging() && !cfg.stopped && !calibrating())
       output = applySlew(output, target, cfg.slew);
+
+    // "Commanding haze but nothing is happening" - out of fluid, heater
+    // reheating, thermal cutout, DMX unplugged, wrong address. It cannot tell
+    // which, but knowing it is happening is the part that matters mid-show.
+    // Saturation is excluded: a pegged sensor cannot show a rise either way.
+    bool judging = output >= NORESP_PCT && !cfg.stopped && !purging() &&
+                   !calibrating() && everRead && sensorOk &&
+                   data.pm25_env < SAT_PM;
+    if (!judging) {
+      outSince = 0;
+      if (noResponse && output < NORESP_PCT) noResponse = false;
+    } else if (!outSince) {
+      outSince = now;
+      pmAtOutStart = data.pm25_env;
+    } else if (now - outSince >= (unsigned long)NORESP_WIN_S * 1000) {
+      int rise = (int)data.pm25_env - pmAtOutStart;
+      if (rise < NORESP_RISE) {
+        if (!noResponse)
+          logEvent("NO RESPONSE: %ds at %u%% and PM2.5 moved %+d", NORESP_WIN_S,
+                   output, rise);
+        noResponse = true;
+      } else if (noResponse) {
+        logEvent("machine responding again (%+d ug/m3)", rise);
+        noResponse = false;
+      }
+      outSince = now;
+      pmAtOutStart = data.pm25_env;
+    }
   }
 
   // Unconditional: frames keep going out at zero as well, so a receiver never
