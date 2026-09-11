@@ -65,7 +65,10 @@ struct {
   int fan = 50;          // 0-100%, independent of haze regulation
   int dmxAddress = 1;    // start address; channel layout depends on fixture
   int fixture = 0;       // index into FIXTURES
-  int lookahead = 0;     // seconds to extrapolate the PM trend; 0 = off
+  int leadFall = 20;     // s of anticipation while levels are falling (on early)
+  int leadRise = 45;     // s while rising (off early) - overshoot costs more
+  int filterTau = 30;    // s, low-pass on the control input; 0 = raw
+  int machineTail = 4;   // s the hazer keeps producing after DMX goes to zero
   bool stopped = false;  // latched stop; survives reboot on purpose
   bool pulseMode = false;  // time-proportional output instead of continuous
   int pulsePeriod = 10;    // seconds per pulse cycle
@@ -86,11 +89,12 @@ unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // the equipment: how long haze takes to arrive, how fast it accumulates at full
 // output, and how slowly it clears. Guessing these is what causes overshoot.
 enum { CAL_OFF = 0, CAL_PURGE, CAL_SETTLE, CAL_PULSE, CAL_DECAY, CAL_DONE, CAL_FAIL };
-#define CAL_SETTLE_S 10
+#define CAL_SETTLE_S 30   // long enough to measure the noise band
 int calState = CAL_OFF;
 unsigned long calT0 = 0, calPeakT = 0;
 int calBaseline = 0, calPeak = 0, calDead = 0, calTau = 0, calPulseUsed = 0;
 bool calBaseHigh = false;
+int calNoiseLo = 0, calNoiseHi = 0, calNoise = 0;
 float calRise = 0;
 char calMsg[128] = "";
 bool calibrating() { return calState >= CAL_PURGE && calState <= CAL_DECAY; }
@@ -200,6 +204,8 @@ void histPush(bool coarse, uint16_t pm, uint8_t out, uint8_t act) {
 uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
+float pmFilt = 0;
+bool pmFiltInit = false;
 int predicted = 0;
 unsigned long outSince = 0;
 int pmAtOutStart = 0;
@@ -251,6 +257,11 @@ float slopeOf(int newest, int oldest, int samples) {
   return samples < 2 ? 0.0f : (float)(newest - oldest) / (samples - 1);
 }
 
+// Falling and rising want different amounts of anticipation. Haze arrives in
+// seconds but clears over many minutes, so being late to stop costs far more
+// than being late to start.
+int leadFor(float slope, int fall, int rise) { return slope < 0 ? fall : rise; }
+
 // Where PM2.5 will be once haze commanded now actually reaches the sensor.
 // Controlling on this instead of the present reading is what buys back the
 // dead time between opening the machine and seeing the result.
@@ -262,11 +273,16 @@ int predict(int pm, float slopePerSec, int lookaheadSec) {
 // Time-proportional output: instead of holding a low continuous level, run the
 // machine at a strong level for a fraction of each cycle. Hazers atomise poorly
 // at low duty, so 20% as 2s-on/8s-off often disperses better than a steady 20%.
-uint8_t dutyLevel(unsigned long ms, int demand, int period, int level) {
+// The machine keeps hazing for a few seconds after DMX drops to zero, so a
+// commanded burst delivers its own length plus that tail. Shorten the command
+// by the tail, or every short pulse overshoots its intended duty.
+uint8_t dutyLevel(unsigned long ms, int demand, int period, int level, int tail) {
   if (demand <= 0) return 0;
   if (demand >= 100) return 100;
   unsigned long per = (unsigned long)period * 1000;
-  return (ms % per) < per * demand / 100 ? (uint8_t)level : 0;
+  long on = (long)(per * demand / 100) - (long)tail * 1000;
+  if (on <= 0) return 0;  // cannot deliver this little; period must be longer
+  return (ms % per) < (unsigned long)on ? (uint8_t)level : 0;
 }
 
 // A fixture occupying n channels cannot start later than 513-n.
@@ -286,14 +302,16 @@ void calFinish() {
   if (calDead < 1) calDead = 1;
   if (calPulseUsed < 1) calPulseUsed = 1;
   calRise = (float)(calPeak - calBaseline) / calPulseUsed;
-  cfg.lookahead = constrain(calDead, 0, 120);
+  cfg.leadFall = constrain(calDead, 0, 120);
+  cfg.leadRise = constrain(calDead * 2, 0, 120);
   cfg.slew = constrain(100 / calDead, 1, 100);
+  if (calNoise > 0) cfg.deadband = constrain(calNoise, 2, 100);
   if (calRise > 0.01f)
     cfg.gain = constrain(50.0f / (calRise * calDead), 0.1f, 10.0f);
   snprintf(calMsg, sizeof(calMsg),
-           "pulse %ds, dead %ds, rise %.1f ug/s, decay %ds -> look %d slew %d gain %.1f",
-           calPulseUsed, calDead, calRise, calTau, cfg.lookahead, cfg.slew,
-           cfg.gain);
+           "pulse %ds dead %ds rise %.1f decay %ds -> lead %d/%d slew %d gain %.1f band %d",
+           calPulseUsed, calDead, calRise, calTau, cfg.leadFall, cfg.leadRise,
+           cfg.slew, cfg.gain, cfg.deadband);
   if (calBaseHigh)
     strncat(calMsg, " (hazy baseline: rise may be understated)",
             sizeof(calMsg) - strlen(calMsg) - 1);
@@ -328,7 +346,12 @@ void runCalibration(unsigned long now, int pm) {
       break;
     case CAL_SETTLE:
       target = output = 0;
+      // Measure how much the control signal moves with the machine off. A
+      // deadband narrower than that just makes the loop chase its own noise.
+      if (el < 2) { calNoiseLo = calNoiseHi = pm; }
+      else { calNoiseLo = min(calNoiseLo, pm); calNoiseHi = max(calNoiseHi, pm); }
       if (el >= CAL_SETTLE_S) {
+        calNoise = calNoiseHi - calNoiseLo;
         calBaseline = pm; calPeak = pm; calDead = 0; calPeakT = 0;
         calPulseUsed = 0;
         calT0 = now; calState = CAL_PULSE;
@@ -383,7 +406,10 @@ void saveCfg() {
   prefs.putInt("fan", cfg.fan);
   prefs.putInt("addr", cfg.dmxAddress);
   prefs.putInt("fixture", cfg.fixture);
-  prefs.putInt("look", cfg.lookahead);
+  prefs.putInt("look", cfg.leadFall);
+  prefs.putInt("leadup", cfg.leadRise);
+  prefs.putInt("tau", cfg.filterTau);
+  prefs.putInt("tail", cfg.machineTail);
   prefs.putBool("stopped", cfg.stopped);
   prefs.putBool("pulse", cfg.pulseMode);
   prefs.putInt("pperiod", cfg.pulsePeriod);
@@ -403,7 +429,10 @@ void loadCfg() {
   cfg.fan = prefs.getInt("fan", cfg.fan);
   cfg.dmxAddress = prefs.getInt("addr", cfg.dmxAddress);
   cfg.fixture = prefs.getInt("fixture", cfg.fixture);
-  cfg.lookahead = prefs.getInt("look", cfg.lookahead);
+  cfg.leadFall = prefs.getInt("look", cfg.leadFall);
+  cfg.leadRise = prefs.getInt("leadup", cfg.leadRise);
+  cfg.filterTau = prefs.getInt("tau", cfg.filterTau);
+  cfg.machineTail = prefs.getInt("tail", cfg.machineTail);
   cfg.stopped = prefs.getBool("stopped", cfg.stopped);
   cfg.pulseMode = prefs.getBool("pulse", cfg.pulseMode);
   cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
@@ -421,7 +450,10 @@ void loadCfg() {
   cfg.deadband = constrain(cfg.deadband, 0, 100);
   cfg.gain = constrain(cfg.gain, 0.1f, 10.0f);
   cfg.slew = constrain(cfg.slew, 1, 100);
-  cfg.lookahead = constrain(cfg.lookahead, 0, 120);
+  cfg.leadFall = constrain(cfg.leadFall, 0, 120);
+  cfg.leadRise = constrain(cfg.leadRise, 0, 120);
+  cfg.filterTau = constrain(cfg.filterTau, 0, 120);
+  cfg.machineTail = constrain(cfg.machineTail, 0, 15);
   cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
   cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
   cfg.calPulse = constrain(cfg.calPulse, 30, 600);
@@ -471,12 +503,18 @@ void selfTest() {
   assert(predict(100, -2.0f, 30) == 40);     // falling fast, act early
   assert(predict(10, -2.0f, 30) == 0);       // clamps at zero
   assert(predict(100, 0.0f, 30) == 100);     // flat trend changes nothing
-  assert(dutyLevel(0, 20, 10, 100) == 100);      // 20% of 10s: on at t=0
-  assert(dutyLevel(1999, 20, 10, 100) == 100);   // still on just before 2s
-  assert(dutyLevel(2001, 20, 10, 100) == 0);     // off after 2s
-  assert(dutyLevel(9999, 20, 10, 100) == 0);     // off until the cycle repeats
-  assert(dutyLevel(5000, 0, 10, 100) == 0);      // zero demand never fires
-  assert(dutyLevel(5000, 100, 10, 100) == 100);  // full demand is continuous
+  assert(leadFor(-1.0f, 20, 45) == 20);      // falling -> start early
+  assert(leadFor(1.0f, 20, 45) == 45);       // rising  -> stop early
+  assert(leadFor(0.0f, 20, 45) == 45);
+  assert(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
+  assert(dutyLevel(1999, 20, 10, 100, 0) == 100);   // still on just before 2s
+  assert(dutyLevel(2001, 20, 10, 100, 0) == 0);     // off after 2s
+  assert(dutyLevel(9999, 20, 10, 100, 0) == 0);     // off until the cycle repeats
+  assert(dutyLevel(5000, 0, 10, 100, 0) == 0);      // zero demand never fires
+  assert(dutyLevel(5000, 100, 10, 100, 0) == 100);  // full demand is continuous
+  assert(dutyLevel(999, 20, 10, 100, 1) == 100);    // 1s tail: command only 1s
+  assert(dutyLevel(1001, 20, 10, 100, 1) == 0);
+  assert(dutyLevel(500, 20, 10, 100, 3) == 0);      // tail alone exceeds the duty
   Serial.println("selfTest ok");
 }
 
@@ -532,6 +570,7 @@ input:disabled{cursor:not-allowed}
 <div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
 <div class=c><span>DMX fan</span><b id=dmxf>-</b></div>
 <div class=c><span>trend ug/m3/s</span><b id=slope>-</b></div>
+<div class=c><span>smoothed PM2.5</span><b id=pmf>-</b></div>
 <div class=c><span>predicted PM2.5</span><b id=pred>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
@@ -568,7 +607,10 @@ input:disabled{cursor:not-allowed}
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
-<label>Lookahead <span id=vla></span>s <i style=color:#666>(0 = react only)</i></label><input type=range id=lookahead min=0 max=120 oninput="post('lookahead',this.value)">
+<label>Machine run-on <span id=vtail></span>s <i style=color:#666>(haze after DMX stops)</i></label><input type=range id=tail min=0 max=15 oninput="post('tail',this.value)">
+<label>Smoothing <span id=vtau></span>s <i style=color:#666>(0 = raw)</i></label><input type=range id=tau min=0 max=120 oninput="post('tau',this.value)">
+<label>Lead when falling <span id=vlf></span>s <i style=color:#666>(start early)</i></label><input type=range id=leadfall min=0 max=120 oninput="post('leadfall',this.value)">
+<label>Lead when rising <span id=vlr></span>s <i style=color:#666>(stop early)</i></label><input type=range id=leadrise min=0 max=120 oninput="post('leadrise',this.value)">
 </details>
 <details id=evtwrap><summary>Event log</summary>
 <pre id=evt></pre>
@@ -679,7 +721,7 @@ async function tick(){
   aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
-  pred.textContent=s.lookahead?s.predicted:'off';
+  pmf.textContent=s.pmf; pred.textContent=(s.leadfall||s.leadrise)?s.predicted:'off';
   obar.style.width=s.output+'%';
   tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
@@ -697,7 +739,8 @@ async function tick(){
        'sensor near saturation - readings unreliable'):'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
-  vfan.textContent=s.fan; fanrow.hidden=!s.hasfan; vla.textContent=s.lookahead;
+  vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
+  vtau.textContent=s.tau; vtail.textContent=s.tail; vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
   s_cal=s.cal; pulseOn=s.pulse; apOn=s.autopurge;
   apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
   pulsebtn.className=s.pulse?'on':'';
@@ -724,7 +767,8 @@ async function tick(){
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
-    lookahead.value=s.lookahead;pperiod.value=s.pperiod;pminon.value=s.pminon;}
+    tau.value=s.tau;tail.value=s.tail;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
+    pperiod.value=s.pperiod;pminon.value=s.pminon;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   draw();
 }
@@ -747,8 +791,9 @@ int calLeft() {
 // period the user dialled in.
 int pulsePeriodNow() {
   if (!cfg.automatic || output <= 0) return cfg.pulsePeriod;
-  int per = (cfg.pulseMinOn * 100 + output - 1) / output;  // round up
-  return constrain(per, 5, 60);
+  // Long enough that a burst still lasts pulseMinOn after the tail is removed.
+  int per = ((cfg.pulseMinOn + cfg.machineTail) * 100 + output - 1) / output;
+  return constrain(per, 5, 120);
 }
 
 // Green while haze is actually being commanded, dark otherwise. In pulse mode
@@ -777,18 +822,19 @@ void updateLed() {
 // What is actually on the wire right now, pulsing included.
 uint8_t hazeLevel() {
   if (cfg.pulseMode && !cfg.stopped && !purging() && !calibrating())
-    return dutyLevel(millis(), output, pulsePeriodNow(), cfg.pulseLevel);
+    return dutyLevel(millis(), output, pulsePeriodNow(), cfg.pulseLevel,
+                     cfg.machineTail);
   return output;
 }
 
 void handleState() {
-  char buf[980];
+  char buf[1100];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"lookahead\":%d,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"pmf\":%d,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
@@ -802,7 +848,8 @@ void handleState() {
            maxAddress(FIXTURES[cfg.fixture].chans),
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
-           cfg.lookahead, pmSlope, predicted, cfg.stopped ? "true" : "false",
+           cfg.leadFall, cfg.leadRise, cfg.filterTau, cfg.machineTail,
+           (int)lroundf(pmFilt), pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.autoPurge ? "true" : "false",
@@ -987,8 +1034,14 @@ void handleSet() {
   if (server.hasArg("deadband")) cfg.deadband = constrain(server.arg("deadband").toInt(), 0, 100);
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
   if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
-  if (server.hasArg("lookahead"))
-    cfg.lookahead = constrain(server.arg("lookahead").toInt(), 0, 120);
+  if (server.hasArg("leadfall"))
+    cfg.leadFall = constrain(server.arg("leadfall").toInt(), 0, 120);
+  if (server.hasArg("leadrise"))
+    cfg.leadRise = constrain(server.arg("leadrise").toInt(), 0, 120);
+  if (server.hasArg("tail"))
+    cfg.machineTail = constrain(server.arg("tail").toInt(), 0, 15);
+  if (server.hasArg("tau"))
+    cfg.filterTau = constrain(server.arg("tau").toInt(), 0, 120);
   if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 100);
   if (server.hasArg("save")) {
     saveAt = 0;  // explicit save: write now rather than on the debounce
@@ -1162,14 +1215,21 @@ void loop() {
     // update in every mode. Computing them only on the automatic path left both
     // stuck at zero in manual, purge and calibration.
     if (everRead && sensorOk) {
-      pmHist[pmIdx] = data.pm25_env;
+      // Low-pass the control input. The sensor sees plume turbulence, not room
+      // average, and differentiating that raw signal produces noise, not trend.
+      int raw = data.pm25_env;
+      if (cfg.filterTau <= 0 || !pmFiltInit) pmFilt = raw;
+      else pmFilt += (raw - pmFilt) / (cfg.filterTau + 1.0f);
+      pmFiltInit = true;
+      pmHist[pmIdx] = (uint16_t)lroundf(pmFilt);
       pmIdx = (pmIdx + 1) % SLOPE_WIN;
       if (pmCount < SLOPE_WIN) pmCount++;
       pmSlope = pmCount < 5 ? 0
                             : slopeOf(pmHist[(pmIdx - 1 + SLOPE_WIN) % SLOPE_WIN],
                                       pmHist[(pmIdx - pmCount + SLOPE_WIN) % SLOPE_WIN],
                                       pmCount);
-      predicted = predict(data.pm25_env, pmSlope, cfg.lookahead);
+      predicted = predict((int)lroundf(pmFilt), pmSlope,
+                          leadFor(pmSlope, cfg.leadFall, cfg.leadRise));
     }
     // A pegged sensor cannot report a trend, so the regulator is flying blind
     // and any output it commands is guesswork. Clear the air instead. Not during
