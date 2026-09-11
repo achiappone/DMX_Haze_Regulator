@@ -306,6 +306,20 @@ int leadFor(float slope, int fall, int rise) { return slope < 0 ? fall : rise; }
 // close the remaining deficit over one dead time. Committing more than the
 // deficit guarantees overshoot regardless of what feedback decides afterwards.
 // Both constants come from calibration; without them the cap does nothing.
+// The deficit that will exist when haze commanded now actually lands, not the
+// one visible today. A decaying room keeps falling throughout the dead time, so
+// dosing for the present gap always arrives short - and on a long dead time it
+// arrives badly short, which reads as the loop refusing to act while levels sink.
+float deficitAtArrival(float setpoint, float measured, float slopePerSec,
+                       int deadTime) {
+  float atArrival = measured + slopePerSec * deadTime;
+  float deficit = setpoint - atArrival;
+  // A briefly steep slope would otherwise project an absurd shortfall and throw
+  // the dose cap wide open. Filling from an empty room needs the target itself
+  // and never more, so that is the ceiling.
+  return deficit > setpoint ? setpoint : deficit;
+}
+
 uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
   if (riseRate <= 0 || deadTime <= 0) return 100;  // uncalibrated: no opinion
   if (gap <= 0) return 0;
@@ -683,6 +697,11 @@ void selfTest() {
   assert(doseCap(1000, 20.0f, 20, 100) == 100);   // huge deficit, still capped
   assert(doseCap(150, 0.0f, 20, 100) == 100);     // uncalibrated: no cap
   assert(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
+  // Falling 0.62/s for 90s adds ~56 to a 135 deficit
+  assert(fabsf(deficitAtArrival(150, 15, -0.62f, 90) - 190.8f) < 0.5f);
+  assert(deficitAtArrival(150, 150, 0.0f, 90) == 0.0f);
+  assert(deficitAtArrival(150, 100, 1.0f, 50) == 0.0f);   // rising: arrives on target
+  assert(deficitAtArrival(150, 20, -9.0f, 90) == 150.0f);  // steep slope, clamped
   float acc = 0;
   assert(computePI(200, 100, 10, 1.0f, 0, acc) == 90);   // Ti=0 is plain P
   assert(acc == 0.0f);
@@ -1651,8 +1670,9 @@ void loop() {
       bool wasLock = riseLock;
       // Applied after the floor: an anti-starvation minimum must not be able
       // to overshoot a target that is already nearly reached.
-      uint8_t cap = doseCap(cfg.setpoint - pmFilt, cfg.riseRate, cfg.deadTime,
-                            cfg.dosePct);
+      uint8_t cap =
+          doseCap(deficitAtArrival(cfg.setpoint, pmFilt, pmSlope, cfg.deadTime),
+                  cfg.riseRate, cfg.deadTime, cfg.dosePct);
       if (target > cap) target = cap;
 
       riseLock = riseLockNext(riseLock, pmSlope, cfg.riseCut);
