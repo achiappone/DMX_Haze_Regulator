@@ -5,6 +5,7 @@
 #include <Adafruit_PM25AQI.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#include <Update.h>
 #include <time.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -748,6 +749,9 @@ input:disabled{cursor:not-allowed}
 <button onclick="fetch('/api/events?clear=1').then(loadEvents)">Clear log</button></div>
 </details>
 <details><summary>Setup</summary>
+<label>Firmware update (.bin) - the board reboots when done</label>
+<form method=POST action=/update enctype=multipart/form-data>
+<input type=file name=firmware accept=.bin><button type=submit>Upload</button></form>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
 <option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
 <option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
@@ -1364,6 +1368,34 @@ void setup() {
   server.on("/api/history", handleHistory);
   server.on("/api/csv", handleCsv);
   server.on("/api/events", handleEvents);
+
+  // Firmware update over wifi. The board lives on a DMX rig, not a desk, so
+  // needing USB for every change stops being practical quickly. No auth: this
+  // is a LAN appliance, and anyone who can reach the control page can already
+  // drive the hazer. Do not expose it beyond the local network.
+  server.on(
+      "/update", HTTP_POST,
+      []() {
+        bool ok = !Update.hasError();
+        server.sendHeader("Connection", "close");
+        server.send(200, "text/plain", ok ? "OK - rebooting" : "FAILED");
+        if (ok) {
+          logEvent("firmware updated over wifi, rebooting");
+          delay(300);
+          ESP.restart();
+        }
+      },
+      []() {
+        HTTPUpload &up = server.upload();
+        if (up.status == UPLOAD_FILE_START) {
+          logEvent("firmware upload started: %s", up.filename.c_str());
+          Update.begin(UPDATE_SIZE_UNKNOWN);
+        } else if (up.status == UPLOAD_FILE_WRITE) {
+          Update.write(up.buf, up.currentSize);
+        } else if (up.status == UPLOAD_FILE_END) {
+          if (!Update.end(true)) logEvent("firmware update failed");
+        }
+      });
   server.on("/api/set", handleSet);
   server.begin();
   prefs.putUInt("boot", bootId);
