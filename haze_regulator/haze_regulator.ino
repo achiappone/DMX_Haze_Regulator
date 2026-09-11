@@ -1573,11 +1573,12 @@ void loop() {
 
   // Unconditional: frames keep going out at zero as well, so a receiver never
   // sees signal loss just because the haze is off.
-  // Reconnect if wifi drops or never came up. Without this a single failed
-  // association at boot leaves the board headless until someone power-cycles it.
+  // Reconnect if wifi drops or never came up, retrying every 10s. Without this
+  // a single failed association at boot leaves the board headless until someone
+  // power-cycles it.
   if (WiFi.status() != WL_CONNECTED) {
     if (!wifiLostAt) wifiLostAt = now;
-    if (now - wifiTry > 20000) {
+    if (now - wifiTry > 10000) {
       wifiTry = now;
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASS);
