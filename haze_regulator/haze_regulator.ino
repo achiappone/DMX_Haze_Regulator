@@ -625,8 +625,8 @@ void selfTest() {
   computePI(200, 190, 10, 1.0f, 100, acc);               // err 0 inside band
   assert(acc == 0.0f);                                   // band does not wind up
   acc = 0;
-  for (int i = 0; i < 50; i++) computePI(200, 195, 10, 0.1f, 100, acc);
-  assert(acc > 0.0f && acc <= 100.0f);                   // droop gets integrated
+  for (int i = 0; i < 50; i++) computePI(200, 180, 10, 0.1f, 100, acc);
+  assert(acc > 0.0f && acc <= 100.0f);  // droop outside the band gets integrated
   acc = 90.0f;
   for (int i = 0; i < 50; i++) computePI(200, 0, 10, 1.0f, 100, acc);
   assert(acc <= 100.0f);                                 // anti-windup caps it
