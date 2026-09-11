@@ -651,79 +651,95 @@ uint8_t applySlew(uint8_t current, uint8_t target, int maxStep) {
   return (uint8_t)(current + d);
 }
 
+// Checks report rather than abort. assert() panics inside setup(), before wifi
+// starts, so a single wrong expectation takes the board off the network with no
+// way in but a cable - which it has now done twice. A failure here is a bug to
+// fix, but it must not cost physical access to the machine.
+int checkFails = 0;
+#define CHECK(c)                                                    \
+  do {                                                              \
+    if (!(c)) {                                                     \
+      checkFails++;                                                 \
+      Serial.printf("SELFTEST FAILED line %d: %s\n", __LINE__, #c); \
+    }                                                               \
+  } while (0)
+
 void selfTest() {
-  assert(computeOutput(150, 200, 10, 1.0f) == 0);   // too hazy -> off
-  assert(computeOutput(150, 150, 10, 1.0f) == 0);   // at target -> off
-  assert(computeOutput(150, 130, 10, 1.0f) == 10);  // err 20, less deadband
-  assert(computeOutput(150, 0, 10, 1.0f) == 100);   // clamps at 100%
-  assert(applySlew(0, 100, 3) == 3);                // ramps up, no blast
-  assert(applySlew(100, 0, 3) == 97);               // ramps down
-  assert(applySlew(40, 41, 3) == 41);               // small step lands exactly
-  assert(applySlew(0, 0, 3) == 0);
-  assert(toDmx(0) == 0);      // off stays off
-  assert(toDmx(1) == 11);     // 1% = lowest live value, skips the dead band
-  assert(toDmx(100) == 255);  // 100%
-  assert(toDmx(50) == 131);   // 50% lands mid-band
-  assert(ledLevel(0) == 0);          // off is dark
-  assert(ledLevel(1) >= 12);         // lowest output is still visible
-  assert(ledLevel(100) == 130);      // full output, capped brightness
-  assert(ledLevel(50) > ledLevel(25) && ledLevel(50) < ledLevel(100));
-  assert(maxAddress(2) == 511);  // Amhaze, 2ch
-  assert(maxAddress(1) == 512);  // Hurricane Haze 1DX, 1ch
-  assert(slopeOf(100, 10, 31) == 3.0f);      // +90 over 30s
-  assert(slopeOf(10, 100, 31) == -3.0f);     // falling
-  assert(slopeOf(50, 50, 1) == 0.0f);        // too few samples
-  assert(predict(100, -2.0f, 30) == 40);     // falling fast, act early
-  assert(predict(10, -2.0f, 30) == 0);       // clamps at zero
-  assert(predict(100, 0.0f, 30) == 100);     // flat trend changes nothing
-  assert(leadFor(-1.0f, 20, 45) == 20);      // falling -> start early
-  assert(leadFor(1.0f, 20, 45) == 45);       // rising  -> stop early
-  assert(leadFor(0.0f, 20, 45) == 45);
-  assert(controlPm(265, 157, 200, 10) == 200);  // below band: capped at target
-  assert(controlPm(195, 157, 200, 10) == 195);  // easing off early is allowed
-  assert(controlPm(265, 300, 200, 10) == 265);  // above band: lead is allowed
-  assert(controlPm(100, 157, 200, 10) == 100);  // leading on early is untouched
+  CHECK(computeOutput(150, 200, 10, 1.0f) == 0);   // too hazy -> off
+  CHECK(computeOutput(150, 150, 10, 1.0f) == 0);   // at target -> off
+  CHECK(computeOutput(150, 130, 10, 1.0f) == 10);  // err 20, less deadband
+  CHECK(computeOutput(150, 0, 10, 1.0f) == 100);   // clamps at 100%
+  CHECK(applySlew(0, 100, 3) == 3);                // ramps up, no blast
+  CHECK(applySlew(100, 0, 3) == 97);               // ramps down
+  CHECK(applySlew(40, 41, 3) == 41);               // small step lands exactly
+  CHECK(applySlew(0, 0, 3) == 0);
+  CHECK(toDmx(0) == 0);      // off stays off
+  CHECK(toDmx(1) == 11);     // 1% = lowest live value, skips the dead band
+  CHECK(toDmx(100) == 255);  // 100%
+  CHECK(toDmx(50) == 131);   // 50% lands mid-band
+  CHECK(ledLevel(0) == 0);          // off is dark
+  CHECK(ledLevel(1) >= 12);         // lowest output is still visible
+  CHECK(ledLevel(100) == 130);      // full output, capped brightness
+  CHECK(ledLevel(50) > ledLevel(25) && ledLevel(50) < ledLevel(100));
+  CHECK(maxAddress(2) == 511);  // Amhaze, 2ch
+  CHECK(maxAddress(1) == 512);  // Hurricane Haze 1DX, 1ch
+  CHECK(slopeOf(100, 10, 31) == 3.0f);      // +90 over 30s
+  CHECK(slopeOf(10, 100, 31) == -3.0f);     // falling
+  CHECK(slopeOf(50, 50, 1) == 0.0f);        // too few samples
+  CHECK(predict(100, -2.0f, 30) == 40);     // falling fast, act early
+  CHECK(predict(10, -2.0f, 30) == 0);       // clamps at zero
+  CHECK(predict(100, 0.0f, 30) == 100);     // flat trend changes nothing
+  CHECK(leadFor(-1.0f, 20, 45) == 20);      // falling -> start early
+  CHECK(leadFor(1.0f, 20, 45) == 45);       // rising  -> stop early
+  CHECK(leadFor(0.0f, 20, 45) == 45);
+  CHECK(controlPm(265, 157, 200, 10) == 200);  // below band: capped at target
+  CHECK(controlPm(195, 157, 200, 10) == 195);  // easing off early is allowed
+  CHECK(controlPm(265, 300, 200, 10) == 265);  // above band: lead is allowed
+  CHECK(controlPm(100, 157, 200, 10) == 100);  // leading on early is untouched
   // A usable gain must reach full output before the room is empty.
-  assert(computeOutput(200, 100, 10, 1.0f) == 90);   // half target -> 90%
-  assert(computeOutput(200, 100, 10, 0.1f) == 9);    // same error at 0.1 -> 9%
-  assert(riseLockNext(false, 5.0f, 3) == true);      // climbing fast -> cut
-  assert(riseLockNext(true, 1.0f, 3) == true);       // still rising -> stay cut
-  assert(riseLockNext(true, -1.0f, 3) == false);     // falling again -> release
-  assert(riseLockNext(true, 0.0f, 3) == false);      // stopped rising -> release
-  assert(riseLockNext(true, 9.0f, 0) == false);      // disabled
+  CHECK(computeOutput(200, 100, 10, 1.0f) == 90);   // half target -> 90%
+  CHECK(computeOutput(200, 100, 10, 0.1f) == 9);    // same error at 0.1 -> 9%
+  CHECK(riseLockNext(false, 5.0f, 3) == true);      // climbing fast -> cut
+  CHECK(riseLockNext(true, 1.0f, 3) == true);       // still rising -> stay cut
+  CHECK(riseLockNext(true, -1.0f, 3) == false);     // falling again -> release
+  CHECK(riseLockNext(true, 0.0f, 3) == false);      // stopped rising -> release
+  CHECK(riseLockNext(true, 9.0f, 0) == false);      // disabled
   // 150 deficit, 20 units/s at full, 20s dead time: 37.5% exactly closes it
-  assert(doseCap(150, 20.0f, 20, 100) == 38);
-  assert(doseCap(0, 20.0f, 20, 100) == 0);        // at target, commit nothing
-  assert(doseCap(1000, 20.0f, 20, 100) == 100);   // huge deficit, still capped
-  assert(doseCap(150, 0.0f, 20, 100) == 100);     // uncalibrated: no cap
-  assert(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
+  CHECK(doseCap(150, 20.0f, 20, 100) == 38);
+  CHECK(doseCap(0, 20.0f, 20, 100) == 0);        // at target, commit nothing
+  CHECK(doseCap(1000, 20.0f, 20, 100) == 100);   // huge deficit, still capped
+  CHECK(doseCap(150, 0.0f, 20, 100) == 100);     // uncalibrated: no cap
+  CHECK(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
   // Falling 0.62/s for 90s adds ~56 to a 135 deficit
-  assert(fabsf(deficitAtArrival(150, 15, -0.62f, 90) - 190.8f) < 0.5f);
-  assert(deficitAtArrival(150, 150, 0.0f, 90) == 0.0f);
-  assert(deficitAtArrival(150, 100, 1.0f, 50) == 0.0f);   // rising: arrives on target
-  assert(deficitAtArrival(150, 20, -9.0f, 90) == 150.0f);  // steep slope, clamped
+  // 190.8 projected, but capped at the setpoint by the clause above
+  CHECK(deficitAtArrival(150, 15, -0.62f, 90) == 150.0f);
+  CHECK(fabsf(deficitAtArrival(150, 120, -0.2f, 90) - 48.0f) < 0.5f);
+  CHECK(deficitAtArrival(150, 150, 0.0f, 90) == 0.0f);
+  CHECK(deficitAtArrival(150, 100, 1.0f, 50) == 0.0f);   // rising: arrives on target
+  CHECK(deficitAtArrival(150, 20, -9.0f, 90) == 150.0f);  // steep slope, clamped
   float acc = 0;
-  assert(computePI(200, 100, 10, 1.0f, 0, acc) == 90);   // Ti=0 is plain P
-  assert(acc == 0.0f);
+  CHECK(computePI(200, 100, 10, 1.0f, 0, acc) == 90);   // Ti=0 is plain P
+  CHECK(acc == 0.0f);
   acc = 0;
   computePI(200, 190, 10, 1.0f, 100, acc);               // err 0 inside band
-  assert(acc == 0.0f);                                   // band does not wind up
+  CHECK(acc == 0.0f);                                   // band does not wind up
   acc = 0;
   for (int i = 0; i < 50; i++) computePI(200, 180, 10, 0.1f, 100, acc);
-  assert(acc > 0.0f && acc <= 100.0f);  // droop outside the band gets integrated
+  CHECK(acc > 0.0f && acc <= 100.0f);  // droop outside the band gets integrated
   acc = 90.0f;
   for (int i = 0; i < 50; i++) computePI(200, 0, 10, 1.0f, 100, acc);
-  assert(acc <= 100.0f);                                 // anti-windup caps it
-  assert(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
-  assert(dutyLevel(1999, 20, 10, 100, 0) == 100);   // still on just before 2s
-  assert(dutyLevel(2001, 20, 10, 100, 0) == 0);     // off after 2s
-  assert(dutyLevel(9999, 20, 10, 100, 0) == 0);     // off until the cycle repeats
-  assert(dutyLevel(5000, 0, 10, 100, 0) == 0);      // zero demand never fires
-  assert(dutyLevel(5000, 100, 10, 100, 0) == 100);  // full demand is continuous
-  assert(dutyLevel(999, 20, 10, 100, 1) == 100);    // 1s tail: command only 1s
-  assert(dutyLevel(1001, 20, 10, 100, 1) == 0);
-  assert(dutyLevel(500, 20, 10, 100, 3) == 0);      // tail alone exceeds the duty
-  Serial.println("selfTest ok");
+  CHECK(acc <= 100.0f);                                 // anti-windup caps it
+  CHECK(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
+  CHECK(dutyLevel(1999, 20, 10, 100, 0) == 100);   // still on just before 2s
+  CHECK(dutyLevel(2001, 20, 10, 100, 0) == 0);     // off after 2s
+  CHECK(dutyLevel(9999, 20, 10, 100, 0) == 0);     // off until the cycle repeats
+  CHECK(dutyLevel(5000, 0, 10, 100, 0) == 0);      // zero demand never fires
+  CHECK(dutyLevel(5000, 100, 10, 100, 0) == 100);  // full demand is continuous
+  CHECK(dutyLevel(999, 20, 10, 100, 1) == 100);    // 1s tail: command only 1s
+  CHECK(dutyLevel(1001, 20, 10, 100, 1) == 0);
+  CHECK(dutyLevel(500, 20, 10, 100, 3) == 0);      // tail alone exceeds the duty
+  if (checkFails) Serial.printf("selfTest: %d CHECK(s) FAILED\n", checkFails);
+  else Serial.println("selfTest ok");
 }
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
@@ -1542,6 +1558,7 @@ void setup() {
   // to be the console.
   logEvent("boot: %s addr %d, trend %d min, ip %s", FIXTURES[cfg.fixture].name,
            cfg.dmxAddress, coarseN, WiFi.localIP().toString().c_str());
+  if (checkFails) logEvent("SELFTEST: %d check(s) failed", checkFails);
   logEvent("  sensor %s, psram %s, history %d/%d, fs %s",
            sensorOk ? "ready" : "NOT RESPONDING at 0x12",
            ESP.getPsramSize() ? "yes" : "no", fineCap, coarseCap,
