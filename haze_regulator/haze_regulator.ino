@@ -572,7 +572,8 @@ input:disabled{cursor:not-allowed}
 </details>
 <details id=evtwrap><summary>Event log</summary>
 <pre id=evt></pre>
-<button onclick="fetch('/api/events?clear=1').then(loadEvents)">Clear log</button>
+<div class=row><button onclick="location='/api/events?download=1'">Download log</button>
+<button onclick="fetch('/api/events?clear=1').then(loadEvents)">Clear log</button></div>
 </details>
 <details><summary>Setup</summary>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
@@ -885,7 +886,12 @@ void handleEvents() {
   File f = LittleFS.open(EVT_PATH, "r");
   if (!f) { server.send(200, "text/plain", "(no events yet)"); return; }
   size_t sz = f.size();
-  if (sz > 12288) { f.seek(sz - 12288); f.readStringUntil('\n'); }
+  bool dl = server.hasArg("download");
+  // The viewer only needs the tail; an export wants the whole file.
+  if (!dl && sz > 12288) { f.seek(sz - 12288); f.readStringUntil('\n'); }
+  if (dl)
+    server.sendHeader("Content-Disposition",
+                      "attachment; filename=haze_events.log");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
   uint8_t b[256];
