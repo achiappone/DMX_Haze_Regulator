@@ -69,6 +69,7 @@ struct {
   int leadRise = 45;     // s while rising (off early) - overshoot costs more
   int filterTau = 30;    // s, low-pass on the control input; 0 = raw
   int machineTail = 4;   // s the hazer keeps producing after DMX goes to zero
+  int floorPct = 10;     // never command less than this when well below target
   bool stopped = false;  // latched stop; survives reboot on purpose
   bool pulseMode = false;  // time-proportional output instead of continuous
   int pulsePeriod = 10;    // seconds per pulse cycle
@@ -112,6 +113,11 @@ struct Sample {
 Sample *fineBuf = nullptr, *coarseBuf = nullptr;
 int fineCap = 7200, coarseCap = 10080;  // 1 hour at 2Hz, 7 days of minutes
 int fineN = 0, fineHead = 0, coarseN = 0, coarseHead = 0;
+// Samples restored from flash were written before this boot, but nothing
+// records how long the board was off. Counting how many minute samples this
+// session wrote lets the rest be placed before boot instead of being folded
+// into the current session's timeline, which put them out of order.
+int coarsePostBoot = 0;
 unsigned long histLast = 0, coarseLast = 0;
 uint32_t cAccPm = 0, cAccOut = 0, cAccAct = 0;
 int cAccN = 0;
@@ -273,7 +279,10 @@ int leadFor(float slope, int fall, int rise) { return slope < 0 ? fall : rise; }
 // rising trend while the room is in fact emptying, and acting on that starves
 // the room exactly when it needs haze.
 int controlPm(int predicted, int measured, int setpoint, int deadband) {
-  if (measured < setpoint - deadband && predicted > measured) return measured;
+  // Below the band, anticipation may still ease output off as levels climb back
+  // toward target - that is how you stop before overshooting. What it must not
+  // do is claim the room is already past target when the sensor says it is not.
+  if (measured < setpoint - deadband && predicted > setpoint) return setpoint;
   return predicted;
 }
 
@@ -425,6 +434,7 @@ void saveCfg() {
   prefs.putInt("leadup", cfg.leadRise);
   prefs.putInt("tau", cfg.filterTau);
   prefs.putInt("tail", cfg.machineTail);
+  prefs.putInt("floor", cfg.floorPct);
   prefs.putBool("stopped", cfg.stopped);
   prefs.putBool("pulse", cfg.pulseMode);
   prefs.putInt("pperiod", cfg.pulsePeriod);
@@ -448,6 +458,7 @@ void loadCfg() {
   cfg.leadRise = prefs.getInt("leadup", cfg.leadRise);
   cfg.filterTau = prefs.getInt("tau", cfg.filterTau);
   cfg.machineTail = prefs.getInt("tail", cfg.machineTail);
+  cfg.floorPct = prefs.getInt("floor", cfg.floorPct);
   cfg.stopped = prefs.getBool("stopped", cfg.stopped);
   cfg.pulseMode = prefs.getBool("pulse", cfg.pulseMode);
   cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
@@ -469,6 +480,7 @@ void loadCfg() {
   cfg.leadRise = constrain(cfg.leadRise, 0, 120);
   cfg.filterTau = constrain(cfg.filterTau, 0, 120);
   cfg.machineTail = constrain(cfg.machineTail, 0, 15);
+  cfg.floorPct = constrain(cfg.floorPct, 0, 50);
   cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
   cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
   cfg.calPulse = constrain(cfg.calPulse, 30, 600);
@@ -521,7 +533,8 @@ void selfTest() {
   assert(leadFor(-1.0f, 20, 45) == 20);      // falling -> start early
   assert(leadFor(1.0f, 20, 45) == 45);       // rising  -> stop early
   assert(leadFor(0.0f, 20, 45) == 45);
-  assert(controlPm(265, 157, 200, 10) == 157);  // below band: trust the reading
+  assert(controlPm(265, 157, 200, 10) == 200);  // below band: capped at target
+  assert(controlPm(195, 157, 200, 10) == 195);  // easing off early is allowed
   assert(controlPm(265, 300, 200, 10) == 265);  // above band: lead is allowed
   assert(controlPm(100, 157, 200, 10) == 100);  // leading on early is untouched
   assert(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
@@ -627,6 +640,7 @@ input:disabled{cursor:not-allowed}
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
+<label>Minimum output when low <span id=vfloor></span>% <i style=color:#666>(anti-starve)</i></label><input type=range id=floor min=0 max=50 oninput="post('floor',this.value)">
 <label>Machine run-on <span id=vtail></span>s <i style=color:#666>(haze after DMX stops)</i></label><input type=range id=tail min=0 max=15 oninput="post('tail',this.value)">
 <label>Smoothing <span id=vtau></span>s <i style=color:#666>(0 = raw)</i></label><input type=range id=tau min=0 max=120 oninput="post('tau',this.value)">
 <label>Lead when falling <span id=vlf></span>s <i style=color:#666>(start early)</i></label><input type=range id=leadfall min=0 max=120 oninput="post('leadfall',this.value)">
@@ -764,7 +778,7 @@ async function tick(){
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
-  vtau.textContent=s.tau; vtail.textContent=s.tail; vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
+  vtau.textContent=s.tau; vtail.textContent=s.tail; vfloor.textContent=s.floor; vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
   s_cal=s.cal; pulseOn=s.pulse; apOn=s.autopurge;
   apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
   pulsebtn.className=s.pulse?'on':'';
@@ -791,7 +805,7 @@ async function tick(){
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
-    tau.value=s.tau;tail.value=s.tail;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
+    tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
     pperiod.value=s.pperiod;pminon.value=s.pminon;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   draw();
@@ -852,13 +866,13 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[1240];
+  char buf[1280];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
@@ -874,6 +888,7 @@ void handleState() {
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.leadFall, cfg.leadRise, cfg.filterTau, cfg.machineTail,
+           cfg.floorPct,
            (int)lroundf(pmFilt), pkSes, (unsigned long)pkSesAt, pkAll,
            (unsigned long)pkAllBoot, (unsigned long)pkAllAt, pkOut,
            pmSlope, predicted, cfg.stopped ? "true" : "false",
@@ -909,6 +924,13 @@ bool pickFine(int win) {
 // buffer still holds. Switching between tiers made the chart jump resolution
 // as the fast buffer filled after a reboot. Each point carries its own age, so
 // the two resolutions can sit side by side on the same axis.
+// Age of minute sample k (0 = newest). Ones this session wrote sit on the
+// current timeline; restored ones are pushed back behind boot.
+long coarseAgeMs(int k) {
+  if (k < coarsePostBoot) return (long)k * HIST_COARSE_MS;
+  return (long)millis() + (long)(k - coarsePostBoot) * HIST_COARSE_MS;
+}
+
 void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first) {
   Sample *buf = coarse ? coarseBuf : fineBuf;
   int cap = coarse ? coarseCap : fineCap;
@@ -920,7 +942,8 @@ void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first)
   for (int k = from + (cnt - 1) * step; k >= from; k -= step) {
     int idx = ((newest - k) % cap + cap) % cap;
     long v;
-    if (field == 0) v = (long)k * per / 100;  // age in tenths of a second
+    if (field == 0)
+      v = (coarse ? coarseAgeMs(k) : (long)k * per) / 100;  // tenths of a second
     else if (field == 1) v = buf[idx].pm;
     else if (field == 2) v = buf[idx].out;
     else v = buf[idx].act;
@@ -944,7 +967,7 @@ void handleHistory() {
     return;
   }
   if (server.hasArg("clear")) {
-    fineN = fineHead = coarseN = coarseHead = 0;
+    fineN = fineHead = coarseN = coarseHead = coarsePostBoot = 0;
     cAccPm = cAccOut = cAccAct = 0;
     cAccN = 0;
     if (fsOk) LittleFS.remove(TREND_PATH);
@@ -960,10 +983,16 @@ void handleHistory() {
   if (fineMs > winMs) fineMs = winMs;
   int fineWant = fineMs / HIST_FINE_MS;
 
-  int coarseSkip = fineMs / HIST_COARSE_MS;  // newest minutes overlap the fine part
-  int coarseWant = (winMs - fineMs) / HIST_COARSE_MS;
-  if (coarseWant > coarseN - coarseSkip) coarseWant = coarseN - coarseSkip;
-  if (coarseWant < 0) coarseWant = 0;
+  // Skip minute samples that the fine part already covers, then take only the
+  // ones whose real age still falls inside the window.
+  int coarseSkip = fineMs / HIST_COARSE_MS;
+  if (coarseSkip > coarsePostBoot) coarseSkip = coarsePostBoot;
+  int coarseWant = 0;
+  for (int k = coarseSkip; k < coarseN; k++) {
+    if (coarseAgeMs(k) <= fineMs) { coarseSkip = k + 1; continue; }
+    if (coarseAgeMs(k) > winMs) break;
+    coarseWant++;
+  }
 
   if (fineWant + coarseWant < 2) {
     server.send(200, "application/json", "{\"n\":0}");
@@ -1075,6 +1104,8 @@ void handleSet() {
     cfg.leadFall = constrain(server.arg("leadfall").toInt(), 0, 120);
   if (server.hasArg("leadrise"))
     cfg.leadRise = constrain(server.arg("leadrise").toInt(), 0, 120);
+  if (server.hasArg("floor"))
+    cfg.floorPct = constrain(server.arg("floor").toInt(), 0, 50);
   if (server.hasArg("tail"))
     cfg.machineTail = constrain(server.arg("tail").toInt(), 0, 15);
   if (server.hasArg("tau"))
@@ -1324,6 +1355,12 @@ void loop() {
       target = 0;  // fail safe: never keep hazing on a stale reading
     } else {
       target = computeOutput(cfg.setpoint, predicted, cfg.deadband, cfg.gain);
+      // Insurance against a wrong trend estimate: whatever the prediction says,
+      // never command nothing while the sensor reports the room well below
+      // target. Being wrong downward means an empty room mid-show.
+      if ((int)lroundf(pmFilt) < cfg.setpoint - 3 * cfg.deadband &&
+          target < cfg.floorPct)
+        target = cfg.floorPct;
     }
     if (!purging() && !cfg.stopped && !calibrating())
       output = applySlew(output, target, cfg.slew);
@@ -1376,6 +1413,7 @@ void loop() {
       uint16_t cpm = cAccPm / cAccN;
       uint8_t co = cAccOut / cAccN, ca = cAccAct / cAccN;
       histPush(true, cpm, co, ca);
+      if (coarsePostBoot < coarseCap) coarsePostBoot++;
       trendAppend(cpm, co, ca);
       cAccPm = cAccOut = cAccAct = 0;
       cAccN = 0;
