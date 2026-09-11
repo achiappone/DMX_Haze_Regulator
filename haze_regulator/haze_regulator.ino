@@ -707,7 +707,7 @@ input:disabled{cursor:not-allowed}
 <div class=c><span>PM2.5 ug/m3</span><b id=pm25>-</b></div>
 <div class=c><span>PM1.0</span><b id=pm10>-</b></div>
 <div class=c><span>PM10</span><b id=pm100>-</b></div>
-<div class=c><span>AQI US</span><b id=aqi>-</b></div>
+<div class=c><span>fine fraction</span><b id=fine>-</b></div>
 <div class=c><span>0.3um count</span><b id=c03>-</b></div>
 <div class=c><span>Haze output</span><b id=out>-</b></div>
 <div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
@@ -788,6 +788,7 @@ let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
 // calls it above the point a const would be declared, and a const in its
 // temporal dead zone throws and aborts the rest of the update.
 function ug(v){return v<10?(+v).toFixed(2).replace(/0+$/,'').replace(/\.$/,''):Math.round(v)}
+function ago(v){return v>=3600?(v/3600|0)+'h '+((v%3600)/60|0)+'m':v>=60?(v/60|0)+'m':v+'s'}
 document.querySelectorAll('input[type=range]').forEach(e=>{
   e.onpointerdown=()=>touching=1; e.onpointerup=()=>touching=0;});
 // Coalesce changes into one request and refresh straight after, so a button
@@ -880,7 +881,10 @@ setInterval(loadHist,1000);loadHist();
 async function tick(){
   let s=await(await fetch('/api/state')).json();
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
-  aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
+  // PM1.0 as a share of PM2.5. Haze droplets are sub-micron, so a high share
+  // means what the sensor sees really is haze; a low one means coarse dust.
+  fine.textContent=s.pm25?Math.round(s.pm10/s.pm25*100)+'%':'-';
+  c03.textContent=s.c03; out.textContent=s.output+'%';
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
   pmf.textContent=s.pmf; ctrl.textContent=ug(s.ctrl);
@@ -888,8 +892,7 @@ async function tick(){
   if(document.activeElement!=source)source.value=s.source;
   // Hand the device a wall clock so the event log can carry real times.
   if(!s.clock)post('epoch',Math.floor(Date.now()/1000)-new Date().getTimezoneOffset()*60);
-  const ago=v=>v>=3600?(v/3600|0)+'h '+((v%3600)/60|0)+'m':v>=60?(v/60|0)+'m':v+'s';
-  peaks.textContent='session peak '+s.pkses+' ug/m3 at '+ago(s.pksesat)+
+  peaks.textContent='up '+ago(s.up)+', wifi '+s.rssi+' dBm  |  session peak '+s.pkses+' ug/m3 at '+ago(s.pksesat)+
     ' uptime, max demand '+s.pkout+'%  |  all-time peak '+s.pkall+
     (s.pkall?' (boot '+s.pkallb+', '+ago(s.pkallat)+')':''); pred.textContent=(s.leadfall||s.leadrise)?s.predicted:'off';
   obar.style.width=s.output+'%';
@@ -1011,7 +1014,7 @@ uint8_t hazeLevel() {
 void handleState() {
   char buf[1440];
   snprintf(buf, sizeof(buf),
-           "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
+           "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"c03\":%u,\"rssi\":%d,\"up\":%lu,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"source\":%d,\"ctrl\":%.2f,\"setpoint\":%.2f,\"deadband\":%.2f,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
@@ -1021,8 +1024,8 @@ void handleState() {
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
-           everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
-           everRead ? data.particles_03um : 0, output, target,
+           everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
+           (int)WiFi.RSSI(), (unsigned long)(millis() / 1000), output, target,
            cfg.automatic ? "true" : "false", cfg.manual, cfg.source,
            (double)ctrlValue(), (double)cfg.setpoint, (double)cfg.deadband,
            cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
