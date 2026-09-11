@@ -28,7 +28,8 @@
 #define SENSOR_POLL_MS 250   // faster than the sensor's ~1s frame rate
 #define SENSOR_STALE_MS 5000
 #define SAT_PM 990        // PMSA003I tops out near 1000; above this it is blind
-#define SAT_PURGE_MS 30000
+#define SAT_PURGE_MIN_MS 15000   // first response to saturation
+#define SAT_PURGE_MAX_MS 120000
 #define DMX_INTERVAL_MS 30  // ~33Hz; full 513-slot packet takes ~23ms
 
 Adafruit_PM25AQI aqi;
@@ -76,6 +77,7 @@ bool sensorOk = false, everRead = false;
 uint8_t output = 0, target = 0;
 unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0, lastControl = 0;
 unsigned long purgeUntil = 0;
+unsigned long satPurgeMs = SAT_PURGE_MIN_MS;  // escalates while it stays pegged
 unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // Calibration measures the three numbers that are properties of the room, not
 // the equipment: how long haze takes to arrive, how fast it accumulates at full
@@ -488,7 +490,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
 <div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
-<span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=30>30s</option><option value=60 selected>1 min</option>
+<span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option></select></span>
 <span class=grp><select id=win onchange="setWin(this.value)">
 <option value=30>30 seconds</option><option value=60>1 minute</option><option value=300>5 minutes</option>
@@ -999,9 +1001,16 @@ void loop() {
     // A pegged sensor cannot report a trend, so the regulator is flying blind
     // and any output it commands is guesswork. Clear the air instead. Not during
     // calibration, which runs its own purge phase and aborts near the ceiling.
-    if (cfg.autoPurge && !cfg.stopped && !calibrating() && everRead && sensorOk &&
-        data.pm25_env >= SAT_PM && !purging())
-      purgeUntil = now + SAT_PURGE_MS;
+    if (cfg.autoPurge && !cfg.stopped && !calibrating() && everRead && sensorOk) {
+      if (data.pm25_env >= SAT_PM && !purging()) {
+        // Start short. If it is still pegged after clearing, the room needs
+        // more than a nudge, so each successive attempt doubles.
+        purgeUntil = now + satPurgeMs;
+        satPurgeMs = min(satPurgeMs * 2, (unsigned long)SAT_PURGE_MAX_MS);
+      } else if (data.pm25_env < SAT_PM - 100) {
+        satPurgeMs = SAT_PURGE_MIN_MS;  // clear of the ceiling: reset escalation
+      }
+    }
 
     if (cfg.stopped) {
       if (calibrating()) purgeUntil = 0;
