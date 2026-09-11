@@ -86,6 +86,40 @@ float calRise = 0;
 char calMsg[128] = "";
 bool calibrating() { return calState >= CAL_PURGE && calState <= CAL_DECAY; }
 
+// On-board trend history, so a browser reload is just a new view of the same
+// data rather than a fresh start. Two tiers: 2Hz detail (fast enough that pulse
+// bursts are not aliased away) and 1-minute averages for the long windows.
+struct Sample {
+  uint16_t pm;
+  uint8_t out;
+  uint8_t act;
+};
+#define HIST_FINE_MS 500
+#define HIST_COARSE_MS 60000
+Sample *fineBuf = nullptr, *coarseBuf = nullptr;
+int fineCap = 7200, coarseCap = 10080;  // 1 hour at 2Hz, 7 days of minutes
+int fineN = 0, fineHead = 0, coarseN = 0, coarseHead = 0;
+unsigned long histLast = 0, coarseLast = 0;
+uint32_t cAccPm = 0, cAccOut = 0, cAccAct = 0;
+int cAccN = 0;
+
+// Only built-in types in the signature: the Arduino preprocessor inserts
+// generated prototypes above this file's struct definitions, so a Sample in the
+// parameter list fails to compile.
+void histPush(bool coarse, uint16_t pm, uint8_t out, uint8_t act) {
+  if (coarse) {
+    if (!coarseBuf) return;
+    coarseBuf[coarseHead] = {pm, out, act};
+    coarseHead = (coarseHead + 1) % coarseCap;
+    if (coarseN < coarseCap) coarseN++;
+  } else {
+    if (!fineBuf) return;
+    fineBuf[fineHead] = {pm, out, act};
+    fineHead = (fineHead + 1) % fineCap;
+    if (fineN < fineCap) fineN++;
+  }
+}
+
 uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
@@ -388,6 +422,7 @@ button.stop.armed{background:#e74c3c;box-shadow:0 0 0 2px #e74c3c55}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
 canvas{width:100%;height:360px;display:block;background:#1c1c1c;border-radius:8px}
 #win,#pdur{width:auto;margin:0 0 12px}
+#csvbtn{margin:0 0 12px 8px}
 details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
@@ -419,6 +454,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
 <option value=86400>24 hours</option><option value=604800>7 days</option></select>
+<button id=csvbtn onclick="location='/api/csv?win='+winSec">Download CSV</button>
 <div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
 <button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button>
@@ -465,50 +501,31 @@ function flush(){
   const q=new URLSearchParams(pend).toString();pend={};
   if(q)fetch('/api/set?'+q).then(tick).catch(()=>{});
 }
-// Two resolutions: 1s detail for the last hour, 1-minute averages beyond it.
-// 7 days at 1Hz would be 604800 samples - too many to hold or to draw.
-const FINE=[],COARSE=[];let acc=null,winSec=600;
-function setWin(v){winSec=+v;draw();}
-function record(pm,out,act,sp){
-  const now=Date.now();
-  FINE.push({t:now,pm:pm,out:out,act:act,sp:sp});
-  while(FINE.length>7200)FINE.shift();   // 2Hz, so an hour of detail
-  if(!acc||now-acc.t>=60000){
-    if(acc)COARSE.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,
-                        act:acc.act/acc.n,sp:acc.sp});
-    while(COARSE.length>10080)COARSE.shift();   // 7 days of minutes
-    acc={t:now,pm:0,out:0,act:0,sp:sp,n:0};
-  }
-  acc.pm+=pm;acc.out+=out;acc.act+=act;acc.sp=sp;acc.n++;
-}
-function series(){
-  if(winSec<=3600)return FINE;
-  const c=COARSE.slice();
-  if(acc&&acc.n)c.push({t:acc.t,pm:acc.pm/acc.n,out:acc.out/acc.n,act:acc.act/acc.n,sp:acc.sp});
-  return c.length>1?c:FINE;   // nothing aggregated yet, show what we have
+// History lives on the ESP32, so a reload is a new view of the same trend
+// rather than a fresh start, and the regulator keeps recording with no browser
+// open at all.
+let winSec=600,HIST=null;
+function setWin(v){winSec=+v;loadHist();}
+async function loadHist(){
+  try{HIST=await(await fetch('/api/history?win='+winSec)).json();draw();}catch(e){}
 }
 function draw(){
   const c=chart,ctx=c.getContext('2d'),dpr=devicePixelRatio||1;
   const w=c.clientWidth,h=c.clientHeight;
   c.width=w*dpr;c.height=h*dpr;ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,w,h);
-  const t1=Date.now(),t0=t1-winSec*1000;
-  let pts=series().filter(p=>p.t>=t0);
-  const step=Math.max(1,Math.ceil(pts.length/(w*2)));
-  if(step>1)pts=pts.filter((_,i)=>i%step==0);
-  span.textContent=pts.length<2?'collecting...':'';
-  if(pts.length<2)return;
+  const H=HIST;
+  if(!H||!H.n||H.n<2){span.textContent='collecting...';return;}
+  span.textContent='';
+  const n=H.n,sp=H.sp;
   const ML=56,MR=50,MT=30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
-  const sp=pts[pts.length-1].sp;
-  const peak=Math.max(...pts.map(p=>p.pm));
-  // Left axis follows the data but never hides the target line.
+  const peak=Math.max(...H.pm);
   const top=Math.max(20,sp*1.25,peak)*1.08;
-  const X=p=>ML+(p.t-t0)/(t1-t0)*pw;
+  const X=i=>ML+i/(n-1)*pw;
   const Ypm=v=>MT+ph-v/top*ph;
   const Ypc=v=>MT+ph-v/100*ph;
   peakLbl.textContent='peak '+Math.round(peak);
-
-  ctx.font='12px system-ui';ctx.textBaseline='middle';  // fixed, never scaled
+  ctx.font='12px system-ui';ctx.textBaseline='middle';
   for(let i=0;i<=4;i++){
     const y=MT+ph-i/4*ph;
     ctx.strokeStyle='#ffffff12';ctx.lineWidth=1;
@@ -519,41 +536,31 @@ function draw(){
     ctx.fillText(i*25+'%',ML+pw+8,y);
   }
   ctx.textAlign='left';
-
   const spy=Ypm(sp);
   ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(ML,spy);ctx.lineTo(ML+pw,spy);ctx.stroke();
   ctx.setLineDash([]);
   const lab='target '+Math.round(sp);
-  ctx.font='bold 17px system-ui';   // fixed: only the number changes, not the size
+  ctx.font='bold 17px system-ui';
   const tw=ctx.measureText(lab).width;
   const by=spy<MT+24?spy+3:spy-24;
   ctx.fillStyle='#000d';ctx.fillRect(ML+pw-tw-13,by,tw+11,23);
   ctx.fillStyle='#fff';ctx.fillText(lab,ML+pw-tw-7,by+16);
-
-  // Shaded area is what is actually on the wire (pulses included); the solid
-  // line is what the controller is asking for.
-  ctx.fillStyle='#e9944440';ctx.beginPath();
-  ctx.moveTo(X(pts[0]),MT+ph);
-  pts.forEach(p=>ctx.lineTo(X(p),Ypc(p.act||0)));
-  ctx.lineTo(X(pts[pts.length-1]),MT+ph);ctx.closePath();ctx.fill();
-
-  const line=(f,col,lw)=>{
-    ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
-    pts.forEach((p,i)=>{const y=f(p);i?ctx.lineTo(X(p),y):ctx.moveTo(X(p),y)});
+  ctx.fillStyle='#e9944440';ctx.beginPath();ctx.moveTo(X(0),MT+ph);
+  for(let i=0;i<n;i++)ctx.lineTo(X(i),Ypc(H.act[i]));
+  ctx.lineTo(X(n-1),MT+ph);ctx.closePath();ctx.fill();
+  const line=(a,Y,col,lw)=>{ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();
+    for(let i=0;i<n;i++){const y=Y(a[i]);i?ctx.lineTo(X(i),y):ctx.moveTo(X(i),y)}
     ctx.stroke();};
-  line(p=>Ypc(p.out),'#e94',1.5);
-  line(p=>Ypm(p.pm),'#4a9',2);
-
+  line(H.out,Ypc,'#e94',1.5);
+  line(H.pm,Ypm,'#4a9',2);
   ctx.font='11px system-ui';ctx.fillStyle='#777';
-  ctx.fillText(winSec<=3600?'1s samples':'1 min averages',ML,h-8);
-  ctx.textAlign='right';
-  ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-8,12);
-  ctx.textAlign='left';
-  ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
-  ctx.textAlign='left';
+  ctx.fillText((H.dt>=60000?(H.dt/60000)+' min':(H.dt/1000)+'s')+' per point',ML,h-8);
+  ctx.textAlign='right';ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-8,12);
+  ctx.textAlign='left';ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
 }
 addEventListener('resize',draw);
+setInterval(loadHist,1000);loadHist();
 async function tick(){
   let s=await(await fetch('/api/state')).json();
   pm25.textContent=s.pm25; pm10.textContent=s.pm10; pm100.textContent=s.pm100;
@@ -599,7 +606,6 @@ async function tick(){
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
     lookahead.value=s.lookahead;pperiod.value=s.pperiod;pminon.value=s.pminon;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
-  record(s.pm25,s.output,s.haze,s.setpoint);
   draw();
 }
 tick();setInterval(tick,500);
@@ -683,6 +689,95 @@ void handleState() {
   server.send(200, "application/json", buf);
 }
 
+// Decimates server-side to at most MAXPTS points: a 7 day window holds 10080
+// samples, and sending them all would be a megabyte of JSON to draw on a strip
+// a few hundred pixels wide.
+#define MAXPTS 420
+void handleHistory() {
+  int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
+  win = constrain(win, 30, 604800);
+  bool fine = win <= 3600;
+  Sample *buf = fine ? fineBuf : coarseBuf;
+  int cap = fine ? fineCap : coarseCap;
+  int n = fine ? fineN : coarseN;
+  int head = fine ? fineHead : coarseHead;
+  int perMs = fine ? HIST_FINE_MS : HIST_COARSE_MS;
+
+  int want = (int)((long)win * 1000 / perMs);
+  if (want > n) want = n;
+  if (!buf || want < 2) {
+    server.send(200, "application/json", "{\"n\":0}");
+    return;
+  }
+  int step = (want + MAXPTS - 1) / MAXPTS;
+  int count = want / step;
+  int newest = (head - 1 + cap) % cap;
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  char head_[96];
+  snprintf(head_, sizeof(head_), "{\"dt\":%d,\"n\":%d,\"sp\":%d,\"pm\":[",
+           perMs * step, count, cfg.setpoint);
+  server.sendContent(head_);
+
+  String chunk;
+  chunk.reserve(1200);
+  for (int f = 0; f < 3; f++) {  // pm, out, act - one pass each
+    if (f) server.sendContent(f == 1 ? "],\"out\":[" : "],\"act\":[");
+    chunk = "";
+    for (int i = count - 1; i >= 0; i--) {
+      int idx = ((newest - i * step) % cap + cap) % cap;
+      Sample &sm = buf[idx];
+      if (i != count - 1) chunk += ',';
+      chunk += (f == 0) ? sm.pm : (f == 1 ? sm.out : sm.act);
+      if (chunk.length() > 1000) {
+        server.sendContent(chunk);
+        chunk = "";
+      }
+    }
+    if (chunk.length()) server.sendContent(chunk);
+  }
+  server.sendContent("]}");
+  server.sendContent("");
+}
+
+// Full resolution, undecimated: the chart wants something drawable, an export
+// wants everything. No RTC on board, so time is expressed as seconds ago.
+void handleCsv() {
+  int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
+  win = constrain(win, 30, 604800);
+  bool fine = win <= 3600;
+  Sample *buf = fine ? fineBuf : coarseBuf;
+  int cap = fine ? fineCap : coarseCap;
+  int n = fine ? fineN : coarseN;
+  int head = fine ? fineHead : coarseHead;
+  int perMs = fine ? HIST_FINE_MS : HIST_COARSE_MS;
+  int want = (int)((long)win * 1000 / perMs);
+  if (want > n) want = n;
+
+  server.sendHeader("Content-Disposition", "attachment; filename=haze_trend.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent("seconds_ago,pm25_ugm3,demand_pct,wire_pct\n");
+  int newest = (head - 1 + cap) % cap;
+  String chunk;
+  chunk.reserve(1400);
+  for (int i = want - 1; i >= 0; i--) {
+    int idx = ((newest - i) % cap + cap) % cap;
+    long ms = (long)i * perMs;  // 2Hz samples need a decimal, or rows collide
+    char row[48];
+    snprintf(row, sizeof(row), "%ld.%01ld,%u,%u,%u\n", ms / 1000,
+             (ms % 1000) / 100, buf[idx].pm, buf[idx].out, buf[idx].act);
+    chunk += row;
+    if (chunk.length() > 1200) {
+      server.sendContent(chunk);
+      chunk = "";
+    }
+  }
+  if (chunk.length()) server.sendContent(chunk);
+  server.sendContent("");
+}
+
 void handleSet() {
   if (server.hasArg("automatic")) cfg.automatic = server.arg("automatic").toInt();
   if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
@@ -743,6 +838,21 @@ void setup() {
   while (!Serial && millis() < 3000) {}
   selfTest();
 
+  // 8MB of PSRAM is otherwise idle; fall back to a much shorter history in
+  // internal RAM if it is not available.
+  fineBuf = (Sample *)ps_malloc((size_t)fineCap * sizeof(Sample));
+  if (!fineBuf) {
+    fineCap = 1200;
+    fineBuf = (Sample *)malloc((size_t)fineCap * sizeof(Sample));
+  }
+  coarseBuf = (Sample *)ps_malloc((size_t)coarseCap * sizeof(Sample));
+  if (!coarseBuf) {
+    coarseCap = 1440;
+    coarseBuf = (Sample *)malloc((size_t)coarseCap * sizeof(Sample));
+  }
+  Serial.printf("history: fine %d, coarse %d (psram %s)\n", fineCap, coarseCap,
+                ESP.getPsramSize() ? "yes" : "no");
+
   prefs.begin("haze", false);
   loadCfg();
   Serial.printf("fixture: %s, addr %d\n", FIXTURES[cfg.fixture].name,
@@ -779,6 +889,8 @@ void setup() {
 
   server.on("/", []() { server.send_P(200, "text/html", PAGE); });
   server.on("/api/state", handleState);
+  server.on("/api/history", handleHistory);
+  server.on("/api/csv", handleCsv);
   server.on("/api/set", handleSet);
   server.begin();
 }
@@ -851,6 +963,24 @@ void loop() {
   // Unconditional: frames keep going out at zero as well, so a receiver never
   // sees signal loss just because the haze is off.
   updateLed();
+
+  if (now - histLast >= HIST_FINE_MS) {
+    histLast = now;
+    uint16_t pm = everRead ? data.pm25_env : 0;
+    uint8_t act = hazeLevel();
+    histPush(false, pm, output, act);
+    cAccPm += pm;
+    cAccOut += output;
+    cAccAct += act;
+    cAccN++;
+    if (now - coarseLast >= HIST_COARSE_MS && cAccN) {
+      coarseLast = now;
+      histPush(true, (uint16_t)(cAccPm / cAccN), (uint8_t)(cAccOut / cAccN),
+               (uint8_t)(cAccAct / cAccN));
+      cAccPm = cAccOut = cAccAct = 0;
+      cAccN = 0;
+    }
+  }
 
   if (now - lastDmx >= DMX_INTERVAL_MS) {
     lastDmx = now;
