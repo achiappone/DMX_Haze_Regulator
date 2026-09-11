@@ -5,6 +5,7 @@
 #include <Adafruit_PM25AQI.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#include <time.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -142,9 +143,20 @@ void logEvent(const char *fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(msg, sizeof(msg), fmt, ap);
   va_end(ap);
-  char line[160];
-  snprintf(line, sizeof(line), "b%lu %lus  %s\n", (unsigned long)bootId,
-           (unsigned long)(millis() / 1000), msg);
+  // No RTC, so the browser hands us its wall clock on connect. Until that
+  // happens, fall back to boot number and uptime.
+  char ts[26];
+  time_t tnow = time(nullptr);
+  if (tnow > 1700000000) {
+    struct tm tmv;
+    localtime_r(&tnow, &tmv);
+    strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
+  } else {
+    snprintf(ts, sizeof(ts), "b%lu %lus", (unsigned long)bootId,
+             (unsigned long)(millis() / 1000));
+  }
+  char line[190];
+  snprintf(line, sizeof(line), "%-15s  %s\n", ts, msg);
   Serial.print(line);
   if (!fsOk) return;
   File f = LittleFS.open(EVT_PATH, "a");
@@ -330,8 +342,15 @@ void calFinish() {
   cfg.leadRise = constrain(calDead * 2, 0, 120);
   cfg.slew = constrain(100 / calDead, 1, 100);
   if (calNoise > 0) cfg.deadband = constrain(calNoise, 2, 100);
-  if (calRise > 0.01f)
+  if (calRise > 0.01f) {
     cfg.gain = constrain(50.0f / (calRise * calDead), 0.1f, 10.0f);
+    // A huge measured rise rate - which is what a sensor sitting in the plume
+    // reports - drives this formula to a gain so low the proportional band is
+    // wider than the setpoint, and output rounds to nothing until levels are
+    // far below target. Insist on reaching full output by half the setpoint.
+    float minGain = 100.0f / max(20, cfg.setpoint / 2);
+    if (cfg.gain < minGain) cfg.gain = minGain;
+  }
   snprintf(calMsg, sizeof(calMsg),
            "pulse %ds dead %ds rise %.1f decay %ds -> lead %d/%d slew %d gain %.1f band %d",
            calPulseUsed, calDead, calRise, calTau, cfg.leadFall, cfg.leadRise,
@@ -537,6 +556,9 @@ void selfTest() {
   assert(controlPm(195, 157, 200, 10) == 195);  // easing off early is allowed
   assert(controlPm(265, 300, 200, 10) == 265);  // above band: lead is allowed
   assert(controlPm(100, 157, 200, 10) == 100);  // leading on early is untouched
+  // A usable gain must reach full output before the room is empty.
+  assert(computeOutput(200, 100, 10, 1.0f) == 90);   // half target -> 90%
+  assert(computeOutput(200, 100, 10, 0.1f) == 9);    // same error at 0.1 -> 9%
   assert(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
   assert(dutyLevel(1999, 20, 10, 100, 0) == 100);   // still on just before 2s
   assert(dutyLevel(2001, 20, 10, 100, 0) == 0);     // off after 2s
@@ -646,7 +668,7 @@ input:disabled{cursor:not-allowed}
 <label>Lead when falling <span id=vlf></span>s <i style=color:#666>(start early)</i></label><input type=range id=leadfall min=0 max=120 oninput="post('leadfall',this.value)">
 <label>Lead when rising <span id=vlr></span>s <i style=color:#666>(stop early)</i></label><input type=range id=leadrise min=0 max=120 oninput="post('leadrise',this.value)">
 </details>
-<details id=evtwrap><summary>Event log</summary>
+<details id=evtwrap open><summary>Event log</summary>
 <pre id=evt></pre>
 <div class=row><button onclick="location='/api/events?download=1'">Download log</button>
 <button onclick="fetch('/api/events?clear=1').then(loadEvents)">Clear log</button></div>
@@ -756,6 +778,8 @@ async function tick(){
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
   pmf.textContent=s.pmf;
+  // Hand the device a wall clock so the event log can carry real times.
+  if(!s.clock)post('epoch',Math.floor(Date.now()/1000)-new Date().getTimezoneOffset()*60);
   const ago=v=>v>=3600?(v/3600|0)+'h '+((v%3600)/60|0)+'m':v>=60?(v/60|0)+'m':v+'s';
   peaks.textContent='session peak '+s.pkses+' ug/m3 at '+ago(s.pksesat)+
     ' uptime, max demand '+s.pkout+'%  |  all-time peak '+s.pkall+
@@ -851,10 +875,14 @@ uint8_t ledLevel(uint8_t pct) {
 }
 
 void updateLed() {
-  int16_t g = ledLevel(hazeLevel());
+  // Red beats green: a pegged sensor means the regulator is blind, which is
+  // worth seeing across the room whatever the output happens to be.
+  bool sat = everRead && sensorOk && data.pm25_env >= SAT_PM;
+  int16_t g = sat ? -1 : ledLevel(hazeLevel());
   if (g == ledGreen) return;  // written only on change: this masks interrupts
   ledGreen = g;
-  rgbLedWrite(RGB_LED_PIN, 0, (uint8_t)g, 0);
+  if (sat) rgbLedWrite(RGB_LED_PIN, 110, 0, 0);
+  else rgbLedWrite(RGB_LED_PIN, 0, (uint8_t)g, 0);
 }
 
 // What is actually on the wire right now, pulsing included.
@@ -866,13 +894,13 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[1280];
+  char buf[1320];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
@@ -888,7 +916,7 @@ void handleState() {
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.leadFall, cfg.leadRise, cfg.filterTau, cfg.machineTail,
-           cfg.floorPct,
+           cfg.floorPct, time(nullptr) > 1700000000 ? "true" : "false",
            (int)lroundf(pmFilt), pkSes, (unsigned long)pkSesAt, pkAll,
            (unsigned long)pkAllBoot, (unsigned long)pkAllAt, pkOut,
            pmSlope, predicted, cfg.stopped ? "true" : "false",
@@ -1104,6 +1132,14 @@ void handleSet() {
     cfg.leadFall = constrain(server.arg("leadfall").toInt(), 0, 120);
   if (server.hasArg("leadrise"))
     cfg.leadRise = constrain(server.arg("leadrise").toInt(), 0, 120);
+  if (server.hasArg("epoch")) {
+    time_t e = (time_t)server.arg("epoch").toInt();
+    if (e > 1700000000 && time(nullptr) < 1700000000) {
+      struct timeval tv = {.tv_sec = e, .tv_usec = 0};
+      settimeofday(&tv, nullptr);
+      logEvent("clock set from browser");
+    }
+  }
   if (server.hasArg("floor"))
     cfg.floorPct = constrain(server.arg("floor").toInt(), 0, 50);
   if (server.hasArg("tail"))
