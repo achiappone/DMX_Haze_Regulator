@@ -60,7 +60,8 @@ const Fixture FIXTURES[] = {
 struct {
   bool automatic = true;
   uint8_t manual = 0;    // 0-100%
-  float setpoint = 150.0f;  // target PM2.5 ug/m3; fractional for very light haze
+  int source = 0;           // 0 = PM2.5 mass, 1 = 0.3um particle count / 100
+  float setpoint = 150.0f;  // target, in whichever unit source selects
   float deadband = 10.0f;   // no output until this far below setpoint
   float gain = 1.0f;     // output % per ug/m3 of error
   int slew = 3;          // max % change per second
@@ -236,7 +237,7 @@ uint32_t pkSesAt = 0, pkAllBoot = 0, pkAllAt = 0;
 unsigned long pkLogged = 0;
 float predicted = 0;
 unsigned long outSince = 0;
-int pmAtOutStart = 0;
+float pmAtOutStart = 0;
 bool noResponse = false;
 bool riseLock = false;
 
@@ -300,6 +301,16 @@ bool riseLockNext(bool cur, float slope, int cut) {
   if (slope >= cut) return true;
   if (slope <= 0) return false;
   return cur;  // between the thresholds: hold whatever we were doing
+}
+
+// The signal the loop regulates on. PM2.5 mass is reported in whole ug/m3, so
+// below about 5 it is quantised into uselessness - clean air reads 0 or 1. The
+// 0.3um count reads in the thousands over the same span, which is where the
+// resolution for very light haze actually lives. Scaled by 100 so one set of
+// tuning constants, ranges and calibration numbers covers both sources.
+float ctrlValue() {
+  if (!everRead) return 0.0f;
+  return cfg.source ? data.particles_03um / 100.0f : (float)data.pm25_env;
 }
 
 // Prediction may hold output back while levels are still above the target band,
@@ -466,6 +477,7 @@ void runCalibration(unsigned long now, int pm) {
 void saveCfg() {
   prefs.putBool("auto", cfg.automatic);
   prefs.putUChar("manual", cfg.manual);
+  prefs.putInt("source", cfg.source);
   prefs.putFloat("setpoint", cfg.setpoint);
   prefs.putFloat("deadband", cfg.deadband);
   prefs.putFloat("gain", cfg.gain);
@@ -492,6 +504,7 @@ void saveCfg() {
 void loadCfg() {
   cfg.automatic = prefs.getBool("auto", cfg.automatic);
   cfg.manual = prefs.getUChar("manual", cfg.manual);
+  cfg.source = prefs.getInt("source", cfg.source);
   cfg.setpoint = prefs.getFloat("setpoint", cfg.setpoint);
   cfg.deadband = prefs.getFloat("deadband", cfg.deadband);
   cfg.gain = prefs.getFloat("gain", cfg.gain);
@@ -519,6 +532,7 @@ void loadCfg() {
       constrain(cfg.dmxAddress, 1, maxAddress(FIXTURES[cfg.fixture].chans));
   cfg.manual = constrain(cfg.manual, 0, 100);
   cfg.fan = constrain(cfg.fan, 0, 100);
+  cfg.source = constrain(cfg.source, 0, 1);
   cfg.setpoint = constrain(cfg.setpoint, 0.0f, 1000.0f);
   cfg.deadband = constrain(cfg.deadband, 0.0f, 100.0f);
   cfg.gain = constrain(cfg.gain, 0.1f, 10.0f);
@@ -699,7 +713,8 @@ input:disabled{cursor:not-allowed}
 <div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
 <div class=c><span>DMX fan</span><b id=dmxf>-</b></div>
 <div class=c><span>trend ug/m3/s</span><b id=slope>-</b></div>
-<div class=c><span>smoothed PM2.5</span><b id=pmf>-</b></div>
+<div class=c><span id=ctrllbl>control signal</span><b id=ctrl>-</b></div>
+<div class=c><span>smoothed</span><b id=pmf>-</b></div>
 <div class=c><span>predicted PM2.5</span><b id=pred>-</b></div>
 <div class=c><span>integral %</span><b id=integ>-</b></div>
 </div>
@@ -757,6 +772,9 @@ input:disabled{cursor:not-allowed}
 <label>Firmware update (.bin) - the board reboots when done</label>
 <form method=POST action=/update enctype=multipart/form-data>
 <input type=file name=firmware accept=.bin><button type=submit>Upload</button></form>
+<label>Control signal</label><select id=source onchange="post('source',this.value)">
+<option value=0>PM2.5 mass (ug/m3)</option>
+<option value=1>0.3um particle count (/100) - finer at low haze</option></select>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
 <option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
 <option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
@@ -860,7 +878,9 @@ async function tick(){
   aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
-  pmf.textContent=s.pmf;
+  pmf.textContent=s.pmf; ctrl.textContent=ug(s.ctrl);
+  ctrllbl.textContent=s.source?'0.3um count /100':'PM2.5 ug/m3';
+  if(document.activeElement!=source)source.value=s.source;
   // Hand the device a wall clock so the event log can carry real times.
   if(!s.clock)post('epoch',Math.floor(Date.now()/1000)-new Date().getTimezoneOffset()*60);
   const ago=v=>v>=3600?(v/3600|0)+'h '+((v%3600)/60|0)+'m':v>=60?(v/60|0)+'m':v+'s';
@@ -991,7 +1011,7 @@ void handleState() {
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
-           "\"setpoint\":%.2f,\"deadband\":%.2f,\"gain\":%.1f,\"slew\":%d,"
+           "\"source\":%d,\"ctrl\":%.2f,\"setpoint\":%.2f,\"deadband\":%.2f,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"risecut\":%d,\"riselock\":%s,\"ti\":%d,\"integ\":%.1f,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
@@ -1001,8 +1021,9 @@ void handleState() {
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.aqi_pm25_us : 0,
            everRead ? data.particles_03um : 0, output, target,
-           cfg.automatic ? "true" : "false", cfg.manual, cfg.setpoint,
-           cfg.deadband, cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
+           cfg.automatic ? "true" : "false", cfg.manual, cfg.source,
+           (double)ctrlValue(), (double)cfg.setpoint, (double)cfg.deadband,
+           cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
            toDmx(hazeLevel()), cfg.fixture,
            FIXTURES[cfg.fixture].fanOff >= 0 ? "true" : "false",
            maxAddress(FIXTURES[cfg.fixture].chans),
@@ -1220,6 +1241,19 @@ void handleSet() {
     if (was != cfg.automatic) logEvent("mode -> %s", cfg.automatic ? "AUTO" : "MANUAL");
   }
   if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
+  if (server.hasArg("source")) {
+    int sc = constrain(server.arg("source").toInt(), 0, 1);
+    if (sc != cfg.source) {
+      cfg.source = sc;
+      // The two signals share tuning constants but not magnitudes, so a switch
+      // starts from that source's own sensible target with nothing carried over.
+      cfg.setpoint = sc ? 20.0f : 150.0f;
+      integ = 0;
+      pmFiltInit = false;
+      pmCount = pmIdx = 0;
+      logEvent("control signal -> %s", sc ? "0.3um count/100" : "PM2.5 ug/m3");
+    }
+  }
   if (server.hasArg("setpoint")) {
     float was = cfg.setpoint;
     cfg.setpoint = constrain(server.arg("setpoint").toFloat(), 0.0f, 1000.0f);
@@ -1473,14 +1507,15 @@ void loop() {
     if (everRead && sensorOk) {
       // Low-pass the control input. The sensor sees plume turbulence, not room
       // average, and differentiating that raw signal produces noise, not trend.
-      int raw = data.pm25_env;
+      float raw = ctrlValue();
       if (cfg.filterTau <= 0 || !pmFiltInit) pmFilt = raw;
       else pmFilt += (raw - pmFilt) / (cfg.filterTau + 1.0f);
       pmFiltInit = true;
 
-      if (raw > pkSes) { pkSes = raw; pkSesAt = millis() / 1000; }
-      if (raw > pkAll) {
-        pkAll = raw;
+      uint16_t rawPm = data.pm25_env;  // peaks stay in ug/m3, whatever we regulate on
+      if (rawPm > pkSes) { pkSes = rawPm; pkSesAt = millis() / 1000; }
+      if (rawPm > pkAll) {
+        pkAll = rawPm;
         pkAllBoot = bootId;
         pkAllAt = millis() / 1000;
         prefs.putUShort("pkall", pkAll);
@@ -1571,16 +1606,16 @@ void loop() {
       if (noResponse && output < NORESP_PCT) noResponse = false;
     } else if (!outSince) {
       outSince = now;
-      pmAtOutStart = data.pm25_env;
+      pmAtOutStart = ctrlValue();
     } else if (now - outSince >= (unsigned long)NORESP_WIN_S * 1000) {
-      int rise = (int)data.pm25_env - pmAtOutStart;
+      float rise = ctrlValue() - pmAtOutStart;
       if (rise < NORESP_RISE) {
         if (!noResponse)
-          logEvent("NO RESPONSE: %ds at %u%% and PM2.5 moved %+d", NORESP_WIN_S,
-                   output, rise);
+          logEvent("NO RESPONSE: %ds at %u%% and signal moved %+.1f",
+                   NORESP_WIN_S, output, rise);
         noResponse = true;
       } else if (noResponse) {
-        logEvent("machine responding again (%+d ug/m3)", rise);
+        logEvent("machine responding again (%+.1f)", rise);
         noResponse = false;
       }
       outSince = now;
