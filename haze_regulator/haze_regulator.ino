@@ -742,6 +742,16 @@ void handleState() {
   server.send(200, "application/json", buf);
 }
 
+// The 2Hz tier lives only in RAM, so after a reboot it is empty while the
+// minute tier has been restored from flash. Prefer whichever actually covers
+// more of the asked-for window, rather than always trusting resolution.
+bool pickFine(int win) {
+  if (win > 3600) return false;
+  long fineMs = (long)fineN * HIST_FINE_MS;
+  long coarseMs = (long)coarseN * HIST_COARSE_MS;
+  return !(fineMs < (long)win * 1000 && coarseMs > fineMs);
+}
+
 // Decimates server-side to at most MAXPTS points: a 7 day window holds 10080
 // samples, and sending them all would be a megabyte of JSON to draw on a strip
 // a few hundred pixels wide.
@@ -749,7 +759,7 @@ void handleState() {
 void handleHistory() {
   int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
   win = constrain(win, 30, 604800);
-  bool fine = win <= 3600;
+  bool fine = pickFine(win);
   Sample *buf = fine ? fineBuf : coarseBuf;
   int cap = fine ? fineCap : coarseCap;
   int n = fine ? fineN : coarseN;
@@ -799,7 +809,7 @@ void handleHistory() {
 void handleCsv() {
   int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
   win = constrain(win, 30, 604800);
-  bool fine = win <= 3600;
+  bool fine = pickFine(win);
   Sample *buf = fine ? fineBuf : coarseBuf;
   int cap = fine ? fineCap : coarseCap;
   int n = fine ? fineN : coarseN;
