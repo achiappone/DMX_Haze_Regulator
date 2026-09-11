@@ -241,6 +241,7 @@ unsigned long outSince = 0;
 float pmAtOutStart = 0;
 bool noResponse = false;
 bool riseLock = false;
+unsigned long zeroSince = 0, zeroLogged = 0;
 
 // Purge clears the air with the machine's own fan: haze off, fan wide open.
 // Overflow-safe compare, so it cannot latch on at the millis() rollover.
@@ -1602,7 +1603,11 @@ void loop() {
       // target. Being wrong downward means an empty room mid-show.
       if (pmFilt < cfg.setpoint - 3 * cfg.deadband && target < cfg.floorPct)
         target = cfg.floorPct;
+      bool wasLock = riseLock;
       riseLock = riseLockNext(riseLock, pmSlope, cfg.riseCut);
+      if (riseLock != wasLock)
+        logEvent(riseLock ? "rise lock on, climbing %+.1f/s" : "rise lock off",
+                 (double)pmSlope);
       if (riseLock) target = 0;  // beats the floor: do not feed a rising room
     }
     if (!purging() && !cfg.stopped && !calibrating()) {
@@ -1611,6 +1616,29 @@ void loop() {
       else output = applySlew(output, target, cfg.slew);
     }
     if (output > pkOut) pkOut = output;
+
+    // Something holding output at zero while the room is below target is the
+    // failure that is hardest to spot: everything looks healthy, the loop just
+    // never acts. Whatever the cause, say so by name rather than leaving it to
+    // be inferred from a flat chart.
+    bool shouldHaze = cfg.automatic && !cfg.stopped && everRead && sensorOk &&
+                      pmFilt < cfg.setpoint - cfg.deadband;
+    if (shouldHaze && output == 0) {
+      if (!zeroSince) zeroSince = now;
+      if (now - zeroSince > 60000 && now - zeroLogged > 300000) {
+        zeroLogged = now;
+        const char *why = purging()          ? "purge active"
+                          : riseLock         ? "rise lock"
+                          : calibrating()    ? "calibrating"
+                          : sensorSaturated()? "sensor saturated"
+                                             : "controller commanding zero";
+        logEvent("output held at 0%% for %lus, %.1f below target: %s",
+                 (unsigned long)((now - zeroSince) / 1000),
+                 (double)(cfg.setpoint - pmFilt), why);
+      }
+    } else {
+      zeroSince = 0;
+    }
 
     // "Commanding haze but nothing is happening" - out of fluid, heater
     // reheating, thermal cutout, DMX unplugged, wrong address. It cannot tell
