@@ -206,6 +206,11 @@ int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
 float pmFilt = 0;
 bool pmFiltInit = false;
+// Peak tracking. Session peaks reset on boot; the all-time peak is kept in NVS
+// with the boot and uptime it happened at, so it can be found in the event log.
+uint16_t pkSes = 0, pkAll = 0, pkOut = 0;
+uint32_t pkSesAt = 0, pkAllBoot = 0, pkAllAt = 0;
+unsigned long pkLogged = 0;
 int predicted = 0;
 unsigned long outSince = 0;
 int pmAtOutStart = 0;
@@ -261,6 +266,16 @@ float slopeOf(int newest, int oldest, int samples) {
 // seconds but clears over many minutes, so being late to stop costs far more
 // than being late to start.
 int leadFor(float slope, int fall, int rise) { return slope < 0 ? fall : rise; }
+
+// Prediction may hold output back while levels are still above the target band,
+// which is the point of leading on the rising side. It must never do so once the
+// measurement itself is already below the band: a lagging filter can show a
+// rising trend while the room is in fact emptying, and acting on that starves
+// the room exactly when it needs haze.
+int controlPm(int predicted, int measured, int setpoint, int deadband) {
+  if (measured < setpoint - deadband && predicted > measured) return measured;
+  return predicted;
+}
 
 // Where PM2.5 will be once haze commanded now actually reaches the sensor.
 // Controlling on this instead of the present reading is what buys back the
@@ -506,6 +521,9 @@ void selfTest() {
   assert(leadFor(-1.0f, 20, 45) == 20);      // falling -> start early
   assert(leadFor(1.0f, 20, 45) == 45);       // rising  -> stop early
   assert(leadFor(0.0f, 20, 45) == 45);
+  assert(controlPm(265, 157, 200, 10) == 157);  // below band: trust the reading
+  assert(controlPm(265, 300, 200, 10) == 265);  // above band: lead is allowed
+  assert(controlPm(100, 157, 200, 10) == 100);  // leading on early is untouched
   assert(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
   assert(dutyLevel(1999, 20, 10, 100, 0) == 100);   // still on just before 2s
   assert(dutyLevel(2001, 20, 10, 100, 0) == 0);     // off after 2s
@@ -551,6 +569,7 @@ details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
 #savebtn{margin-left:auto}
+#pkclr{padding:2px 8px;font-size:11px;margin-left:auto}
 .dim{opacity:.32}
 #evt{max-height:230px;overflow:auto;font:11px ui-monospace,Menlo,monospace;
 color:#bbb;background:#151515;padding:9px;border-radius:8px;white-space:pre-wrap;
@@ -578,6 +597,7 @@ input:disabled{cursor:not-allowed}
 <canvas id=chart></canvas>
 <div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#ffb069>haze demand % (dashed)</i><i style=color:#e99444>actual on wire (shaded)</i>
 <i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
+<div class=leg><i id=peaks></i><button id=pkclr onclick="if(confirm('Clear recorded peaks?'))fetch('/api/history?clearpeaks=1')">Clear peaks</button></div>
 <div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
 <span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
@@ -721,7 +741,11 @@ async function tick(){
   aqi.textContent=s.aqi; c03.textContent=s.c03; out.textContent=s.output+'%';
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
-  pmf.textContent=s.pmf; pred.textContent=(s.leadfall||s.leadrise)?s.predicted:'off';
+  pmf.textContent=s.pmf;
+  const ago=v=>v>=3600?(v/3600|0)+'h '+((v%3600)/60|0)+'m':v>=60?(v/60|0)+'m':v+'s';
+  peaks.textContent='session peak '+s.pkses+' ug/m3 at '+ago(s.pksesat)+
+    ' uptime, max demand '+s.pkout+'%  |  all-time peak '+s.pkall+
+    (s.pkall?' (boot '+s.pkallb+', '+ago(s.pkallat)+')':''); pred.textContent=(s.leadfall||s.leadrise)?s.predicted:'off';
   obar.style.width=s.output+'%';
   tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
@@ -828,13 +852,14 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[1100];
+  char buf[1240];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"pmf\":%d,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
+           "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
@@ -849,7 +874,9 @@ void handleState() {
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.leadFall, cfg.leadRise, cfg.filterTau, cfg.machineTail,
-           (int)lroundf(pmFilt), pmSlope, predicted, cfg.stopped ? "true" : "false",
+           (int)lroundf(pmFilt), pkSes, (unsigned long)pkSesAt, pkAll,
+           (unsigned long)pkAllBoot, (unsigned long)pkAllAt, pkOut,
+           pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.autoPurge ? "true" : "false",
@@ -906,6 +933,16 @@ void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first)
 }
 
 void handleHistory() {
+  if (server.hasArg("clearpeaks")) {
+    pkSes = pkOut = pkAll = 0;
+    pkSesAt = pkAllBoot = pkAllAt = 0;
+    prefs.putUShort("pkall", 0);
+    prefs.putUInt("pkallb", 0);
+    prefs.putUInt("pkallat", 0);
+    logEvent("peaks cleared");
+    server.send(200, "application/json", "{\"n\":0}");
+    return;
+  }
   if (server.hasArg("clear")) {
     fineN = fineHead = coarseN = coarseHead = 0;
     cAccPm = cAccOut = cAccAct = 0;
@@ -1136,6 +1173,9 @@ void setup() {
   prefs.begin("haze", false);
   loadCfg();
   bootId = prefs.getUInt("boot", 0) + 1;  // must follow prefs.begin()
+  pkAll = prefs.getUShort("pkall", 0);
+  pkAllBoot = prefs.getUInt("pkallb", 0);
+  pkAllAt = prefs.getUInt("pkallat", 0);
   Serial.printf("fixture: %s, addr %d\n", FIXTURES[cfg.fixture].name,
                 cfg.dmxAddress);
 
@@ -1221,6 +1261,20 @@ void loop() {
       if (cfg.filterTau <= 0 || !pmFiltInit) pmFilt = raw;
       else pmFilt += (raw - pmFilt) / (cfg.filterTau + 1.0f);
       pmFiltInit = true;
+
+      if (raw > pkSes) { pkSes = raw; pkSesAt = millis() / 1000; }
+      if (raw > pkAll) {
+        pkAll = raw;
+        pkAllBoot = bootId;
+        pkAllAt = millis() / 1000;
+        prefs.putUShort("pkall", pkAll);
+        prefs.putUInt("pkallb", pkAllBoot);
+        prefs.putUInt("pkallat", pkAllAt);
+        if (now - pkLogged > 60000) {  // rate limited: a rising peak is noisy
+          logEvent("new all-time peak %u ug/m3", pkAll);
+          pkLogged = now;
+        }
+      }
       pmHist[pmIdx] = (uint16_t)lroundf(pmFilt);
       pmIdx = (pmIdx + 1) % SLOPE_WIN;
       if (pmCount < SLOPE_WIN) pmCount++;
@@ -1230,6 +1284,8 @@ void loop() {
                                       pmCount);
       predicted = predict((int)lroundf(pmFilt), pmSlope,
                           leadFor(pmSlope, cfg.leadFall, cfg.leadRise));
+      predicted = controlPm(predicted, (int)lroundf(pmFilt), cfg.setpoint,
+                            cfg.deadband);
     }
     // A pegged sensor cannot report a trend, so the regulator is flying blind
     // and any output it commands is guesswork. Clear the air instead. Not during
@@ -1271,6 +1327,7 @@ void loop() {
     }
     if (!purging() && !cfg.stopped && !calibrating())
       output = applySlew(output, target, cfg.slew);
+    if (output > pkOut) pkOut = output;
 
     // "Commanding haze but nothing is happening" - out of fluid, heater
     // reheating, thermal cutout, DMX unplugged, wrong address. It cannot tell
