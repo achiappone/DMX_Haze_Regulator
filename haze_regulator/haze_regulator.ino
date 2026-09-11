@@ -341,8 +341,9 @@ void selfTest() {
   assert(toDmx(1) == 11);     // 1% = lowest live value, skips the dead band
   assert(toDmx(100) == 255);  // 100%
   assert(toDmx(50) == 131);   // 50% lands mid-band
-  assert(ledLevel(0) == 0);         // off is dark
-  assert(ledLevel(100) == 120);     // full output, capped brightness
+  assert(ledLevel(0) == 0);          // off is dark
+  assert(ledLevel(1) >= 12);         // lowest output is still visible
+  assert(ledLevel(100) == 130);      // full output, capped brightness
   assert(ledLevel(50) > ledLevel(25) && ledLevel(50) < ledLevel(100));
   assert(maxAddress(2) == 511);  // Amhaze, 2ch
   assert(maxAddress(1) == 512);  // Hurricane Haze 1DX, 1ch
@@ -630,13 +631,14 @@ int pulsePeriodNow() {
 uint8_t hazeLevel();  // forward decl
 int16_t ledGreen = -1;
 
-// Green channel scaled by the haze percentage actually on the wire. Gamma 2.2,
-// because LED output is linear in value but the eye is not - without it 50%
-// output looks closer to three quarters brightness. Capped well below full:
-// these onboard LEDs are painfully bright at 255.
+// Green channel scaled by the haze percentage actually on the wire. Gamma
+// curves the response, since LED output is linear in value but the eye is not.
+// A floor of 12 matters more than strict perceptual accuracy: at gamma 2.2 a
+// typical 19% output landed on 7 of 255, which is invisible in a lit room, and
+// an indicator you cannot see is worse than a slightly non-linear one.
 uint8_t ledLevel(uint8_t pct) {
   if (pct == 0) return 0;
-  return 4 + (uint8_t)(powf(pct / 100.0f, 2.2f) * 116.0f);
+  return 12 + (uint8_t)(powf(pct / 100.0f, 1.6f) * 118.0f);
 }
 
 void updateLed() {
