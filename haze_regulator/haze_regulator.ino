@@ -116,7 +116,45 @@ int cAccN = 0;
 // reflash, or the venue killing power. Appending 4 bytes a minute keeps the
 // write load trivial; the file is rotated only once it holds twice the ring.
 #define TREND_PATH "/trend.bin"
+#define EVT_PATH "/events.log"
+#define EVT_MAX 196608  // 192KB, months of transitions
 bool fsOk = false;
+uint32_t bootId = 0;
+
+// No RTC, so events are stamped with a boot counter plus uptime. That is enough
+// to say "third boot, 41 minutes in" and to line an event up against the trend.
+void logEvent(const char *fmt, ...) {
+  char msg[110];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  char line[160];
+  snprintf(line, sizeof(line), "b%lu %lus  %s\n", (unsigned long)bootId,
+           (unsigned long)(millis() / 1000), msg);
+  Serial.print(line);
+  if (!fsOk) return;
+  File f = LittleFS.open(EVT_PATH, "a");
+  if (!f) return;
+  f.print(line);
+  size_t sz = f.size();
+  f.close();
+  if (sz <= EVT_MAX) return;
+  File in = LittleFS.open(EVT_PATH, "r");        // keep the newer half
+  if (!in) return;
+  in.seek(sz / 2);
+  File out = LittleFS.open("/events.tmp", "w");
+  if (!out) { in.close(); return; }
+  in.readStringUntil('\n');                      // drop the partial line
+  uint8_t b[256];
+  int r;
+  while ((r = in.read(b, sizeof(b))) > 0) out.write(b, r);
+  in.close();
+  out.close();
+  LittleFS.remove(EVT_PATH);
+  LittleFS.rename("/events.tmp", EVT_PATH);
+}
+
 
 void trendAppend(uint16_t pm, uint8_t out, uint8_t act) {
   if (!fsOk) return;
@@ -230,6 +268,7 @@ int maxAddress(uint8_t chans) { return DMX_PACKET_SIZE - chans; }
 
 void calFail(const char *m) {
   snprintf(calMsg, sizeof(calMsg), "%s", m);
+  logEvent("calibration failed: %s", m);
   calState = CAL_FAIL;
   target = output = 0;
 }
@@ -252,6 +291,7 @@ void calFinish() {
   if (calBaseHigh)
     strncat(calMsg, " (hazy baseline: rise may be understated)",
             sizeof(calMsg) - strlen(calMsg) - 1);
+  logEvent("calibration done: %s", calMsg);
   calState = CAL_DONE;
   target = output = 0;
   saveAt = millis() + 500;
@@ -468,6 +508,9 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
 #savebtn{margin-left:auto}
 .dim{opacity:.32}
+#evt{max-height:230px;overflow:auto;font:11px ui-monospace,Menlo,monospace;
+color:#bbb;background:#151515;padding:9px;border-radius:8px;white-space:pre-wrap;
+margin:0 0 8px}
 input:disabled{cursor:not-allowed}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
@@ -520,6 +563,10 @@ input:disabled{cursor:not-allowed}
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
 <label>Lookahead <span id=vla></span>s <i style=color:#666>(0 = react only)</i></label><input type=range id=lookahead min=0 max=120 oninput="post('lookahead',this.value)">
+</details>
+<details id=evtwrap><summary>Event log</summary>
+<pre id=evt></pre>
+<button onclick="fetch('/api/events?clear=1').then(loadEvents)">Clear log</button>
 </details>
 <details><summary>Setup</summary>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
@@ -605,6 +652,13 @@ function draw(){
   ctx.textAlign='left';ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
 }
 addEventListener('resize',draw);
+async function loadEvents(){
+  if(!evtwrap.open)return;
+  try{evt.textContent=await(await fetch('/api/events')).text();
+      evt.scrollTop=evt.scrollHeight;}catch(e){}
+}
+evtwrap.addEventListener('toggle',loadEvents);
+setInterval(loadEvents,5000);
 setInterval(loadHist,1000);loadHist();
 async function tick(){
   let s=await(await fetch('/api/state')).json();
@@ -806,6 +860,27 @@ void handleHistory() {
 
 // Full resolution, undecimated: the chart wants something drawable, an export
 // wants everything. No RTC on board, so time is expressed as seconds ago.
+void handleEvents() {
+  if (server.hasArg("clear")) {
+    if (fsOk) LittleFS.remove(EVT_PATH);
+    logEvent("log cleared");
+    server.send(200, "text/plain", "");
+    return;
+  }
+  if (!fsOk) { server.send(200, "text/plain", "no filesystem"); return; }
+  File f = LittleFS.open(EVT_PATH, "r");
+  if (!f) { server.send(200, "text/plain", "(no events yet)"); return; }
+  size_t sz = f.size();
+  if (sz > 12288) { f.seek(sz - 12288); f.readStringUntil('\n'); }
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain", "");
+  uint8_t b[256];
+  int r;
+  while ((r = f.read(b, sizeof(b))) > 0) server.sendContent((const char *)b, r);
+  f.close();
+  server.sendContent("");
+}
+
 void handleCsv() {
   int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
   win = constrain(win, 30, 604800);
@@ -842,7 +917,11 @@ void handleCsv() {
 }
 
 void handleSet() {
-  if (server.hasArg("automatic")) cfg.automatic = server.arg("automatic").toInt();
+  if (server.hasArg("automatic")) {
+    bool was = cfg.automatic;
+    cfg.automatic = server.arg("automatic").toInt();
+    if (was != cfg.automatic) logEvent("mode -> %s", cfg.automatic ? "AUTO" : "MANUAL");
+  }
   if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
   if (server.hasArg("setpoint")) cfg.setpoint = constrain(server.arg("setpoint").toInt(), 0, 1000);
   if (server.hasArg("deadband")) cfg.deadband = constrain(server.arg("deadband").toInt(), 0, 100);
@@ -855,7 +934,11 @@ void handleSet() {
     saveAt = 0;  // explicit save: write now rather than on the debounce
     saveCfg();
   }
-  if (server.hasArg("stop")) cfg.stopped = server.arg("stop").toInt();
+  if (server.hasArg("stop")) {
+    bool was = cfg.stopped;
+    cfg.stopped = server.arg("stop").toInt();
+    if (was != cfg.stopped) logEvent(cfg.stopped ? "STOP engaged" : "STOP released");
+  }
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
   if (server.hasArg("autopurge")) cfg.autoPurge = server.arg("autopurge").toInt();
   if (server.hasArg("pminon"))
@@ -867,6 +950,7 @@ void handleSet() {
   if (server.hasArg("calibrate")) {
     if (server.arg("calibrate").toInt()) {
       calState = CAL_PURGE; calT0 = millis(); calMsg[0] = 0;
+      logEvent("calibration started, %ds pulse", cfg.calPulse);
     } else {
       calState = CAL_OFF; calMsg[0] = 0; purgeUntil = 0;
     }
@@ -874,11 +958,13 @@ void handleSet() {
   if (server.hasArg("purge")) {
     int secs = constrain(server.arg("purge").toInt(), 0, 600);
     purgeUntil = secs ? millis() + (unsigned long)secs * 1000 : 0;
+    logEvent(secs ? "purge started, %ds" : "purge cancelled", secs);
   }
   if (server.hasArg("fixture")) {
     int f = constrain(server.arg("fixture").toInt(), 0, (int)FIXTURE_COUNT - 1);
     if (f != cfg.fixture) {
       cfg.fixture = f;
+      logEvent("fixture -> %s", FIXTURES[f].name);
       memset(dmxData + 1, 0, DMX_PACKET_SIZE - 1);  // release old channels
     }
   }
@@ -930,6 +1016,7 @@ void setup() {
       f.close();
     }
     Serial.printf("trend restored from flash: %d minutes\n", coarseN);
+    bootId = prefs.getUInt("boot", 0) + 1;
   } else {
     Serial.println("LittleFS mount failed - trend will not survive a reboot");
   }
@@ -972,8 +1059,12 @@ void setup() {
   server.on("/api/state", handleState);
   server.on("/api/history", handleHistory);
   server.on("/api/csv", handleCsv);
+  server.on("/api/events", handleEvents);
   server.on("/api/set", handleSet);
   server.begin();
+  prefs.putUInt("boot", bootId);
+  logEvent("boot: %s addr %d, trend %d min, ip %s", FIXTURES[cfg.fixture].name,
+           cfg.dmxAddress, coarseN, WiFi.localIP().toString().c_str());
 }
 
 void loop() {
@@ -998,6 +1089,11 @@ void loop() {
     }
   }
   sensorOk = (now - lastGoodRead <= SENSOR_STALE_MS);
+  static bool lastOk = true;
+  if (everRead && sensorOk != lastOk) {
+    logEvent(sensorOk ? "sensor recovered" : "SENSOR LOST");
+    lastOk = sensorOk;
+  }
 
   if (now - lastControl >= 1000) {
     lastControl = now;
@@ -1023,6 +1119,8 @@ void loop() {
         // Start short. If it is still pegged after clearing, the room needs
         // more than a nudge, so each successive attempt doubles.
         purgeUntil = now + satPurgeMs;
+        logEvent("saturated at %u ug/m3, auto-purge %lus", data.pm25_env,
+                 satPurgeMs / 1000);
         satPurgeMs = min(satPurgeMs * 2, (unsigned long)SAT_PURGE_MAX_MS);
       } else if (data.pm25_env < SAT_PM - 100) {
         satPurgeMs = SAT_PURGE_MIN_MS;  // clear of the ceiling: reset escalation
