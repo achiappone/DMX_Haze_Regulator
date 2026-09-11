@@ -71,6 +71,8 @@ struct {
   int filterTau = 30;    // s, low-pass on the control input; 0 = raw
   int machineTail = 4;   // s the hazer keeps producing after DMX goes to zero
   int floorPct = 10;     // never command less than this when well below target
+  int riseCut = 3;       // ug/m3/s climb that latches output off; 0 = disabled
+  int integralTi = 300;  // integral time, seconds; 0 = proportional only
   bool stopped = false;  // latched stop; survives reboot on purpose
   bool pulseMode = false;  // time-proportional output instead of continuous
   int pulsePeriod = 10;    // seconds per pulse cycle
@@ -223,6 +225,7 @@ uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
 float pmFilt = 0;
+float integ = 0;  // integral contribution, in output percent
 bool pmFiltInit = false;
 // Peak tracking. Session peaks reset on boot; the all-time peak is kept in NVS
 // with the boot and uptime it happened at, so it can be found in the event log.
@@ -233,6 +236,7 @@ int predicted = 0;
 unsigned long outSince = 0;
 int pmAtOutStart = 0;
 bool noResponse = false;
+bool riseLock = false;
 
 // Purge clears the air with the machine's own fan: haze off, fan wide open.
 // Overflow-safe compare, so it cannot latch on at the millis() rollover.
@@ -284,6 +288,17 @@ float slopeOf(int newest, int oldest, int samples) {
 // seconds but clears over many minutes, so being late to stop costs far more
 // than being late to start.
 int leadFor(float slope, int fall, int rise) { return slope < 0 ? fall : rise; }
+
+// Once levels are climbing quickly, the haze already in flight will keep them
+// climbing for tens of seconds. Adding more only buys overshoot, so latch output
+// off and hold it there until the rise actually stops. Latching matters: release
+// on "not rising fast" would chatter, release on "falling" does not.
+bool riseLockNext(bool cur, float slope, int cut) {
+  if (cut <= 0) return false;
+  if (slope >= cut) return true;
+  if (slope <= 0) return false;
+  return cur;  // between the thresholds: hold whatever we were doing
+}
 
 // Prediction may hold output back while levels are still above the target band,
 // which is the point of leading on the rising side. It must never do so once the
@@ -342,8 +357,15 @@ void calFinish() {
   cfg.leadRise = constrain(calDead * 2, 0, 120);
   cfg.slew = constrain(100 / calDead, 1, 100);
   if (calNoise > 0) cfg.deadband = constrain(calNoise, 2, 100);
+  // Integral time tracks the room's own decay constant: integrate no faster
+  // than the process can actually respond, or the loop winds itself up.
+  if (calTau > 0) cfg.integralTi = constrain(calTau, 30, 1800);
   if (calRise > 0.01f) {
-    cfg.gain = constrain(50.0f / (calRise * calDead), 0.1f, 10.0f);
+    // Lambda (IMC) tuning rather than Ziegler-Nichols. ZN assumes you can
+    // afford to oscillate around setpoint; here you cannot, because haze
+    // arrives in seconds and clears over many minutes.
+    float lambda = 3.0f * calDead;
+    cfg.gain = constrain(100.0f / (calRise * (lambda + calDead)), 0.05f, 10.0f);
     // A huge measured rise rate - which is what a sensor sitting in the plume
     // reports - drives this formula to a gain so low the proportional band is
     // wider than the setpoint, and output rounds to nothing until levels are
@@ -454,6 +476,8 @@ void saveCfg() {
   prefs.putInt("tau", cfg.filterTau);
   prefs.putInt("tail", cfg.machineTail);
   prefs.putInt("floor", cfg.floorPct);
+  prefs.putInt("risecut", cfg.riseCut);
+  prefs.putInt("ti", cfg.integralTi);
   prefs.putBool("stopped", cfg.stopped);
   prefs.putBool("pulse", cfg.pulseMode);
   prefs.putInt("pperiod", cfg.pulsePeriod);
@@ -478,6 +502,8 @@ void loadCfg() {
   cfg.filterTau = prefs.getInt("tau", cfg.filterTau);
   cfg.machineTail = prefs.getInt("tail", cfg.machineTail);
   cfg.floorPct = prefs.getInt("floor", cfg.floorPct);
+  cfg.riseCut = prefs.getInt("risecut", cfg.riseCut);
+  cfg.integralTi = prefs.getInt("ti", cfg.integralTi);
   cfg.stopped = prefs.getBool("stopped", cfg.stopped);
   cfg.pulseMode = prefs.getBool("pulse", cfg.pulseMode);
   cfg.pulsePeriod = prefs.getInt("pperiod", cfg.pulsePeriod);
@@ -500,18 +526,46 @@ void loadCfg() {
   cfg.filterTau = constrain(cfg.filterTau, 0, 120);
   cfg.machineTail = constrain(cfg.machineTail, 0, 15);
   cfg.floorPct = constrain(cfg.floorPct, 0, 50);
+  cfg.riseCut = constrain(cfg.riseCut, 0, 50);
+  cfg.integralTi = constrain(cfg.integralTi, 0, 1800);
   cfg.pulsePeriod = constrain(cfg.pulsePeriod, 5, 60);
   cfg.pulseLevel = constrain(cfg.pulseLevel, 10, 100);
   cfg.calPulse = constrain(cfg.calPulse, 30, 600);
   cfg.pulseMinOn = constrain(cfg.pulseMinOn, 1, 10);
 }
 
-// Proportional with deadband. Pure, so selfTest() can check it.
-uint8_t computeOutput(int setpoint, int pm25, int deadband, float gain) {
+// PI with a deadband. Proportional alone always settles short of target - it
+// needs a standing error to produce the output that balances the room's decay -
+// and that droop is what the integral removes. No derivative term: the lead
+// times already anticipate, and differentiating this sensor amplifies noise.
+//
+// Anti-windup is conditional integration: stop accumulating whenever the output
+// is already pinned at a limit and the error pushes it further that way. Without
+// it the integral charges through a long saturation and then will not let go.
+uint8_t computePI(int setpoint, int pm25, int deadband, float gain, int ti,
+                  float &acc) {
   int err = setpoint - pm25;
-  if (err <= deadband) return 0;
-  long out = lroundf(gain * (err - deadband));
-  return out > 100 ? 100 : (uint8_t)out;
+  if (err > deadband) err -= deadband;
+  else if (err < -deadband) err += deadband;
+  else err = 0;
+  float p = gain * err;
+  float out = p + acc;
+  if (ti > 0) {
+    bool pinned = (out >= 100.0f && err > 0) || (out <= 0.0f && err < 0);
+    if (!pinned) acc += gain * err / ti;  // control tick is 1s
+    acc = constrain(acc, 0.0f, 100.0f);
+    out = p + acc;
+  } else {
+    acc = 0;
+  }
+  long r = lroundf(out);
+  return r < 0 ? 0 : (r > 100 ? 100 : (uint8_t)r);
+}
+
+// Proportional-only wrapper, used by the tests.
+uint8_t computeOutput(int setpoint, int pm25, int deadband, float gain) {
+  float ignore = 0;
+  return computePI(setpoint, pm25, deadband, gain, 0, ignore);
 }
 
 // Rate-limits output movement. Doubles as the fix for two problems: haze takes
@@ -559,6 +613,23 @@ void selfTest() {
   // A usable gain must reach full output before the room is empty.
   assert(computeOutput(200, 100, 10, 1.0f) == 90);   // half target -> 90%
   assert(computeOutput(200, 100, 10, 0.1f) == 9);    // same error at 0.1 -> 9%
+  assert(riseLockNext(false, 5.0f, 3) == true);      // climbing fast -> cut
+  assert(riseLockNext(true, 1.0f, 3) == true);       // still rising -> stay cut
+  assert(riseLockNext(true, -1.0f, 3) == false);     // falling again -> release
+  assert(riseLockNext(true, 0.0f, 3) == false);      // stopped rising -> release
+  assert(riseLockNext(true, 9.0f, 0) == false);      // disabled
+  float acc = 0;
+  assert(computePI(200, 100, 10, 1.0f, 0, acc) == 90);   // Ti=0 is plain P
+  assert(acc == 0.0f);
+  acc = 0;
+  computePI(200, 190, 10, 1.0f, 100, acc);               // err 0 inside band
+  assert(acc == 0.0f);                                   // band does not wind up
+  acc = 0;
+  for (int i = 0; i < 50; i++) computePI(200, 195, 10, 0.1f, 100, acc);
+  assert(acc > 0.0f && acc <= 100.0f);                   // droop gets integrated
+  acc = 90.0f;
+  for (int i = 0; i < 50; i++) computePI(200, 0, 10, 1.0f, 100, acc);
+  assert(acc <= 100.0f);                                 // anti-windup caps it
   assert(dutyLevel(0, 20, 10, 100, 0) == 100);      // 20% of 10s: on at t=0
   assert(dutyLevel(1999, 20, 10, 100, 0) == 100);   // still on just before 2s
   assert(dutyLevel(2001, 20, 10, 100, 0) == 0);     // off after 2s
@@ -626,6 +697,7 @@ input:disabled{cursor:not-allowed}
 <div class=c><span>trend ug/m3/s</span><b id=slope>-</b></div>
 <div class=c><span>smoothed PM2.5</span><b id=pmf>-</b></div>
 <div class=c><span>predicted PM2.5</span><b id=pred>-</b></div>
+<div class=c><span>integral %</span><b id=integ>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
 <div id=warn></div>
@@ -662,6 +734,8 @@ input:disabled{cursor:not-allowed}
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
+<label>Integral time <span id=vti></span>s <i style=color:#666>(0 = proportional only)</i></label><input type=range id=ti min=0 max=1800 step=10 oninput="post('ti',this.value)">
+<label>Cut off above rise rate <span id=vrc></span> ug/m3/s <i style=color:#666>(0 = off)</i></label><input type=range id=risecut min=0 max=50 oninput="post('risecut',this.value)">
 <label>Minimum output when low <span id=vfloor></span>% <i style=color:#666>(anti-starve)</i></label><input type=range id=floor min=0 max=50 oninput="post('floor',this.value)">
 <label>Machine run-on <span id=vtail></span>s <i style=color:#666>(haze after DMX stops)</i></label><input type=range id=tail min=0 max=15 oninput="post('tail',this.value)">
 <label>Smoothing <span id=vtau></span>s <i style=color:#666>(0 = raw)</i></label><input type=range id=tau min=0 max=120 oninput="post('tau',this.value)">
@@ -796,13 +870,16 @@ async function tick(){
   warn.className=stopped?'halt':'';
   warn.textContent=stopped?'OUTPUT STOPPED':
     !s.sensorOk?'SENSOR LOST - output ramping to zero':
+    s.riselock?'RISING FAST - output held off until it levels out':
     s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
     (s.pm25>=990?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
   vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
-  vtau.textContent=s.tau; vtail.textContent=s.tail; vfloor.textContent=s.floor; vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
+  vtau.textContent=s.tau; vtail.textContent=s.tail; vfloor.textContent=s.floor;
+  vrc.textContent=s.risecut; vti.textContent=s.ti;
+  integ.textContent=s.integ.toFixed(1); vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
   s_cal=s.cal; pulseOn=s.pulse; apOn=s.autopurge;
   apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
   pulsebtn.className=s.pulse?'on':'';
@@ -829,7 +906,8 @@ async function tick(){
   if(document.activeElement!=fixture)fixture.value=s.fixture;
   if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
-    tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
+    tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;risecut.value=s.risecut;
+    ti.value=s.ti;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
     pperiod.value=s.pperiod;pminon.value=s.pminon;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   draw();
@@ -894,13 +972,13 @@ uint8_t hazeLevel() {
 }
 
 void handleState() {
-  char buf[1320];
+  char buf[1440];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
            "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
-           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
+           "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"risecut\":%d,\"riselock\":%s,\"ti\":%d,\"integ\":%.1f,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
@@ -916,7 +994,9 @@ void handleState() {
            purging() ? (int)((purgeUntil - millis()) / 1000) : 0,
            FIXTURES[cfg.fixture].fanOff >= 0 ? toDmx(purging() ? 100 : cfg.fan) : 0,
            cfg.leadFall, cfg.leadRise, cfg.filterTau, cfg.machineTail,
-           cfg.floorPct, time(nullptr) > 1700000000 ? "true" : "false",
+           cfg.floorPct, cfg.riseCut, riseLock ? "true" : "false",
+           cfg.integralTi, integ,
+           time(nullptr) > 1700000000 ? "true" : "false",
            (int)lroundf(pmFilt), pkSes, (unsigned long)pkSesAt, pkAll,
            (unsigned long)pkAllBoot, (unsigned long)pkAllAt, pkOut,
            pmSlope, predicted, cfg.stopped ? "true" : "false",
@@ -1140,6 +1220,10 @@ void handleSet() {
       logEvent("clock set from browser");
     }
   }
+  if (server.hasArg("ti"))
+    cfg.integralTi = constrain(server.arg("ti").toInt(), 0, 1800);
+  if (server.hasArg("risecut"))
+    cfg.riseCut = constrain(server.arg("risecut").toInt(), 0, 50);
   if (server.hasArg("floor"))
     cfg.floorPct = constrain(server.arg("floor").toInt(), 0, 50);
   if (server.hasArg("tail"))
@@ -1370,6 +1454,10 @@ void loop() {
       }
     }
 
+    // Anything that overrides the loop invalidates the accumulated integral.
+    if (cfg.stopped || !cfg.automatic || purging() || calibrating() || riseLock)
+      integ = 0;
+
     if (cfg.stopped) {
       if (calibrating()) purgeUntil = 0;
       calState = CAL_OFF;
@@ -1390,16 +1478,22 @@ void loop() {
     } else if (!everRead || !sensorOk) {
       target = 0;  // fail safe: never keep hazing on a stale reading
     } else {
-      target = computeOutput(cfg.setpoint, predicted, cfg.deadband, cfg.gain);
+      target = computePI(cfg.setpoint, predicted, cfg.deadband, cfg.gain,
+                         cfg.integralTi, integ);
       // Insurance against a wrong trend estimate: whatever the prediction says,
       // never command nothing while the sensor reports the room well below
       // target. Being wrong downward means an empty room mid-show.
       if ((int)lroundf(pmFilt) < cfg.setpoint - 3 * cfg.deadband &&
           target < cfg.floorPct)
         target = cfg.floorPct;
+      riseLock = riseLockNext(riseLock, pmSlope, cfg.riseCut);
+      if (riseLock) target = 0;  // beats the floor: do not feed a rising room
     }
-    if (!purging() && !cfg.stopped && !calibrating())
-      output = applySlew(output, target, cfg.slew);
+    if (!purging() && !cfg.stopped && !calibrating()) {
+      // Cutting is always the safe direction, so skip the slew on a rise lock.
+      if (riseLock) output = 0;
+      else output = applySlew(output, target, cfg.slew);
+    }
     if (output > pkOut) pkOut = output;
 
     // "Commanding haze but nothing is happening" - out of fluid, heater
