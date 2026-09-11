@@ -9,6 +9,6 @@ OUT=$(mktemp -d)
 arduino-cli compile --warnings all -b "$FQBN" --output-dir "$OUT" haze_regulator
 BIN="$OUT/haze_regulator.ino.bin"
 echo "uploading $(wc -c < "$BIN") bytes to $HOST"
-curl -f --max-time 180 -F "firmware=@$BIN" "http://$HOST/update"
+curl -f --no-progress-meter --max-time 300 -F "firmware=@$BIN" "http://$HOST/update"
 echo
 rm -rf "$OUT"

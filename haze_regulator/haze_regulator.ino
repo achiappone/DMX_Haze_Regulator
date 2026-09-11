@@ -88,6 +88,7 @@ bool sensorOk = false, everRead = false;
 uint8_t output = 0, target = 0;
 unsigned long lastRead = 0, lastGoodRead = 0, lastDmx = 0, lastControl = 0;
 unsigned long purgeUntil = 0;
+unsigned long wifiTry = 0, wifiLostAt = 0;
 unsigned long satPurgeMs = SAT_PURGE_MIN_MS;  // escalates while it stays pegged
 unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // Calibration measures the three numbers that are properties of the room, not
@@ -1353,14 +1354,17 @@ void setup() {
     delay(300);
     Serial.print(".");
   }
-  // ponytail: no AP fallback yet. Regulation still runs headless without wifi;
-  // add SoftAP or BLE provisioning when creds need changing at a venue.
+  // Regulation still runs headless without wifi, but loop() keeps retrying:
+  // giving up permanently at boot means one missed association leaves the board
+  // unreachable with no way back except a power cycle, which is exactly how an
+  // over-the-air update stranded it.
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\nhttp://%s/  (or http://haze.local/)\n",
                   WiFi.localIP().toString().c_str());
     MDNS.begin("haze");
   } else {
-    Serial.println("\nno wifi - regulating headless");
+    Serial.println("\nno wifi - regulating headless, will keep retrying");
+    wifiLostAt = millis();
   }
 
   server.on("/", []() { server.send_P(200, "text/html", PAGE); });
@@ -1399,8 +1403,18 @@ void setup() {
   server.on("/api/set", handleSet);
   server.begin();
   prefs.putUInt("boot", bootId);
+  // Everything worth seeing at boot goes to the event log as well as Serial:
+  // with no USB attached the serial monitor is unreachable, so the event log has
+  // to be the console.
   logEvent("boot: %s addr %d, trend %d min, ip %s", FIXTURES[cfg.fixture].name,
            cfg.dmxAddress, coarseN, WiFi.localIP().toString().c_str());
+  logEvent("  sensor %s, psram %s, history %d/%d, fs %s",
+           sensorOk ? "ready" : "NOT RESPONDING at 0x12",
+           ESP.getPsramSize() ? "yes" : "no", fineCap, coarseCap,
+           fsOk ? "ok" : "MOUNT FAILED");
+  logEvent("  dmx on GPIO%d, DE GPIO%d, wifi %s rssi %d", DMX_TX_PIN, DMX_EN_PIN,
+           WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "DISCONNECTED",
+           (int)WiFi.RSSI());
 }
 
 void loop() {
@@ -1559,6 +1573,30 @@ void loop() {
 
   // Unconditional: frames keep going out at zero as well, so a receiver never
   // sees signal loss just because the haze is off.
+  // Reconnect if wifi drops or never came up. Without this a single failed
+  // association at boot leaves the board headless until someone power-cycles it.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiLostAt) wifiLostAt = now;
+    if (now - wifiTry > 20000) {
+      wifiTry = now;
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    // Still nothing after ten minutes: the radio or stack is wedged, and a
+    // restart is the only remaining move. Regulation resumes on the way back.
+    if (now - wifiLostAt > 600000) {
+      logEvent("wifi down 10 min, restarting");
+      delay(100);
+      ESP.restart();
+    }
+  } else if (wifiLostAt) {
+    wifiLostAt = 0;
+    MDNS.end();
+    MDNS.begin("haze");
+    logEvent("wifi reconnected, ip %s rssi %d",
+             WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+  }
+
   updateLed();
 
   if (now - histLast >= HIST_FINE_MS) {
