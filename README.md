@@ -87,6 +87,7 @@ Manual Rev. 3, "DMX Values".
 ## Everyday commands
 
     npm run ota       # build and push over wifi - the normal path
+    npm run bin       # build a .bin into build/ for the web uploader
     npm run build     # compile only
     npm run usb       # compile and flash over USB
     npm run monitor   # serial monitor
@@ -98,6 +99,11 @@ Manual Rev. 3, "DMX Values".
     npm run open      # open the control page
 
 Host, serial port and FQBN live in the `config` block of package.json.
+
+The Setup section of the web page has a firmware picker that posts to the same
+endpoint, so a phone can update the board at the rig. Use `npm run bin` to get a
+.bin somewhere findable first - arduino-cli otherwise leaves it in a cache
+directory.
 
 Wifi updates need a build that already contains the /update endpoint, so the
 first install of it has to go over USB. After that USB is only needed if an

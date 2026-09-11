@@ -18,6 +18,7 @@
     "csv": "curl -s --max-time 30 -OJ 'http://$npm_package_config_host/api/csv?win=3600' && echo saved haze_trend.csv",
     "stop": "curl -s 'http://$npm_package_config_host/api/set?stop=1' && echo STOP engaged",
     "go": "curl -s 'http://$npm_package_config_host/api/set?stop=0' && echo STOP released",
-    "open": "open http://$npm_package_config_host/"
+    "open": "open http://$npm_package_config_host/",
+    "bin": "arduino-cli compile --warnings all -b $npm_package_config_fqbn --output-dir build haze_regulator && echo && ls -lh build/haze_regulator.ino.bin"
   }
 }
