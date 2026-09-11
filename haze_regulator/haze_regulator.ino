@@ -616,7 +616,11 @@ function draw(){
   const ML=56,MR=50,MT=30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
   const peak=Math.max(...H.pm);
   const top=Math.max(20,sp*1.25,peak)*1.08;
-  const X=i=>ML+i/(n-1)*pw;
+  // Position by real elapsed time, not by index. Spreading whatever points
+  // exist across the full width made 30 minutes of data in a 24 hour window
+  // look like a full day of history.
+  const spanMs=winSec*1000;
+  const X=i=>Math.max(ML,ML+pw-((n-1-i)*H.dt)/spanMs*pw);
   const Ypm=v=>MT+ph-v/top*ph;
   const Ypc=v=>MT+ph-v/100*ph;
   peakLbl.textContent='peak '+Math.round(peak);
@@ -1036,13 +1040,13 @@ void setup() {
       f.close();
     }
     Serial.printf("trend restored from flash: %d minutes\n", coarseN);
-    bootId = prefs.getUInt("boot", 0) + 1;
   } else {
     Serial.println("LittleFS mount failed - trend will not survive a reboot");
   }
 
   prefs.begin("haze", false);
   loadCfg();
+  bootId = prefs.getUInt("boot", 0) + 1;  // must follow prefs.begin()
   Serial.printf("fixture: %s, addr %d\n", FIXTURES[cfg.fixture].name,
                 cfg.dmxAddress);
 
