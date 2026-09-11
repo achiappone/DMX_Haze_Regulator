@@ -467,6 +467,8 @@ details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
 #savebtn{margin-left:auto}
+.dim{opacity:.32}
+input:disabled{cursor:not-allowed}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
 </style>
@@ -499,7 +501,7 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
 <option value=86400>24 hours</option><option value=604800>7 days</option></select><button id=csvbtn onclick="location='/api/csv?win='+winSec">Download CSV</button></span>
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
-<label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)">
+<div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
 <details><summary>Tuning</summary>
@@ -515,8 +517,8 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 <div class=row><button id=apbtn onclick="post('autopurge',apOn?0:1)">Auto-purge on saturation</button></div>
 <div class=row><button id=pulsebtn onclick="post('pulse',pulseOn?0:1)">Pulse mode</button>
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
-<label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)">
-<label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)">
+<div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
+<div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
 <label>Lookahead <span id=vla></span>s <i style=color:#666>(0 = react only)</i></label><input type=range id=lookahead min=0 max=120 oninput="post('lookahead',this.value)">
 </details>
 <details><summary>Setup</summary>
@@ -615,6 +617,11 @@ async function tick(){
   tmark.style.left=s.target+'%';
   mode.textContent=s.automatic?'AUTO':'MANUAL';
   mode.className=s.automatic?'on':''; mode.dataset.v=s.automatic?1:0;
+  // Fade and disable whatever the current mode ignores, so a slider that does
+  // nothing cannot be mistaken for one that is not working.
+  manrow.classList.toggle('dim',s.automatic); manual.disabled=s.automatic;
+  pprow.classList.toggle('dim',s.automatic); pperiod.disabled=s.automatic;
+  pmrow.classList.toggle('dim',!s.automatic); pminon.disabled=!s.automatic;
   warn.className=stopped?'halt':'';
   warn.textContent=stopped?'OUTPUT STOPPED':
     !s.sensorOk?'SENSOR LOST - output ramping to zero':
