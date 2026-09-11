@@ -647,7 +647,8 @@ function draw(){
   ctx.setLineDash([]);
   line(H.pm,Ypm,'#4a9',2);
   ctx.font='11px system-ui';ctx.fillStyle='#777';
-  ctx.fillText((H.dt>=60000?(H.dt/60000)+' min':(H.dt/1000)+'s')+' per point',ML,h-8);
+  ctx.fillText((H.dt>=60000?(H.dt/60000)+' min':(H.dt/1000)+'s')+' per point'+
+    (winSec<=3600&&H.dt>=60000?' - fine detail still filling':''),ML,h-8);
   ctx.textAlign='right';ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-8,12);
   ctx.textAlign='left';ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
 }
@@ -801,9 +802,15 @@ void handleState() {
 // more of the asked-for window, rather than always trusting resolution.
 bool pickFine(int win) {
   if (win > 3600) return false;
+  // Under two minutes the minute tier yields one point or none, so however
+  // sparse the fast tier is, it is the only one that can draw anything.
+  if (win < 120) return true;
   long fineMs = (long)fineN * HIST_FINE_MS;
   long coarseMs = (long)coarseN * HIST_COARSE_MS;
-  return !(fineMs < (long)win * 1000 && coarseMs > fineMs);
+  // Half a window of real detail beats a full window of minute averages.
+  // Demanding full coverage meant every reboot gave ten chunky points for the
+  // first ten minutes, even though 2Hz data was already piling up.
+  return fineMs * 2 >= (long)win * 1000 || fineMs >= coarseMs;
 }
 
 // Decimates server-side to at most MAXPTS points: a 7 day window holds 10080
