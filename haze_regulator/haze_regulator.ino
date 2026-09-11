@@ -4,6 +4,7 @@
 //         shield TX->GPIO17, shield 2->GPIO16, 5V, GND. Leave 0 and 3 open.
 #include <Adafruit_PM25AQI.h>
 #include <ESPmDNS.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -109,6 +110,36 @@ int cAccN = 0;
 // Only built-in types in the signature: the Arduino preprocessor inserts
 // generated prototypes above this file's struct definitions, so a Sample in the
 // parameter list fails to compile.
+// The minute tier is mirrored to flash so the trend survives a reboot, a
+// reflash, or the venue killing power. Appending 4 bytes a minute keeps the
+// write load trivial; the file is rotated only once it holds twice the ring.
+#define TREND_PATH "/trend.bin"
+bool fsOk = false;
+
+void trendAppend(uint16_t pm, uint8_t out, uint8_t act) {
+  if (!fsOk) return;
+  File f = LittleFS.open(TREND_PATH, "a");
+  if (!f) return;
+  uint8_t rec[4] = {(uint8_t)(pm & 0xFF), (uint8_t)(pm >> 8), out, act};
+  f.write(rec, 4);
+  size_t sz = f.size();
+  f.close();
+  if (sz / 4 <= (size_t)coarseCap * 2) return;
+
+  File in = LittleFS.open(TREND_PATH, "r");
+  if (!in) return;
+  in.seek((in.size() / 4 - coarseCap) * 4);
+  File out2 = LittleFS.open("/trend.tmp", "w");
+  if (!out2) { in.close(); return; }
+  uint8_t buf[256];
+  int r;
+  while ((r = in.read(buf, sizeof(buf))) > 0) out2.write(buf, r);
+  in.close();
+  out2.close();
+  LittleFS.remove(TREND_PATH);
+  LittleFS.rename("/trend.tmp", TREND_PATH);
+}
+
 void histPush(bool coarse, uint16_t pm, uint8_t out, uint8_t act) {
   if (coarse) {
     if (!coarseBuf) return;
@@ -867,6 +898,23 @@ void setup() {
   Serial.printf("history: fine %d, coarse %d (psram %s)\n", fineCap, coarseCap,
                 ESP.getPsramSize() ? "yes" : "no");
 
+  fsOk = LittleFS.begin(true);
+  if (fsOk) {
+    File f = LittleFS.open(TREND_PATH, "r");
+    if (f) {
+      size_t recs = f.size() / 4;
+      size_t skip = recs > (size_t)coarseCap ? recs - coarseCap : 0;
+      f.seek(skip * 4);
+      uint8_t rec[4];
+      while (f.read(rec, 4) == 4)
+        histPush(true, (uint16_t)(rec[0] | (rec[1] << 8)), rec[2], rec[3]);
+      f.close();
+    }
+    Serial.printf("trend restored from flash: %d minutes\n", coarseN);
+  } else {
+    Serial.println("LittleFS mount failed - trend will not survive a reboot");
+  }
+
   prefs.begin("haze", false);
   loadCfg();
   Serial.printf("fixture: %s, addr %d\n", FIXTURES[cfg.fixture].name,
@@ -996,8 +1044,10 @@ void loop() {
     cAccN++;
     if (now - coarseLast >= HIST_COARSE_MS && cAccN) {
       coarseLast = now;
-      histPush(true, (uint16_t)(cAccPm / cAccN), (uint8_t)(cAccOut / cAccN),
-               (uint8_t)(cAccAct / cAccN));
+      uint16_t cpm = cAccPm / cAccN;
+      uint8_t co = cAccOut / cAccN, ca = cAccAct / cAccN;
+      histPush(true, cpm, co, ca);
+      trendAppend(cpm, co, ca);
       cAccPm = cAccOut = cAccAct = 0;
       cAccN = 0;
     }
