@@ -17,6 +17,10 @@
 #define SCL_PIN 9
 #define DMX_TX_PIN 17
 #define DMX_EN_PIN 16
+// Onboard addressable LED. The generic S3 variant puts it on GPIO48; some
+// clones have a board bug and wire it to 38 instead - change this if it stays
+// dark while DMX is clearly running.
+#define RGB_LED_PIN RGB_BUILTIN
 #define DMX_UART UART_NUM_1
 #define DMX_PACKET_SIZE 513  // start code + 512 slots
 #define SLOPE_WIN 30       // seconds of PM history used for the trend
@@ -337,6 +341,9 @@ void selfTest() {
   assert(toDmx(1) == 11);     // 1% = lowest live value, skips the dead band
   assert(toDmx(100) == 255);  // 100%
   assert(toDmx(50) == 131);   // 50% lands mid-band
+  assert(ledLevel(0) == 0);         // off is dark
+  assert(ledLevel(100) == 120);     // full output, capped brightness
+  assert(ledLevel(50) > ledLevel(25) && ledLevel(50) < ledLevel(100));
   assert(maxAddress(2) == 511);  // Amhaze, 2ch
   assert(maxAddress(1) == 512);  // Hurricane Haze 1DX, 1ch
   assert(slopeOf(100, 10, 31) == 3.0f);      // +90 over 30s
@@ -617,6 +624,28 @@ int pulsePeriodNow() {
   return constrain(per, 5, 60);
 }
 
+// Green while haze is actually being commanded, dark otherwise. In pulse mode
+// this blinks with the bursts, which is a useful at-a-glance duty indicator.
+// Written only on change: driving the LED briefly masks interrupts.
+uint8_t hazeLevel();  // forward decl
+int16_t ledGreen = -1;
+
+// Green channel scaled by the haze percentage actually on the wire. Gamma 2.2,
+// because LED output is linear in value but the eye is not - without it 50%
+// output looks closer to three quarters brightness. Capped well below full:
+// these onboard LEDs are painfully bright at 255.
+uint8_t ledLevel(uint8_t pct) {
+  if (pct == 0) return 0;
+  return 4 + (uint8_t)(powf(pct / 100.0f, 2.2f) * 116.0f);
+}
+
+void updateLed() {
+  int16_t g = ledLevel(hazeLevel());
+  if (g == ledGreen) return;  // written only on change: this masks interrupts
+  ledGreen = g;
+  rgbLedWrite(RGB_LED_PIN, 0, (uint8_t)g, 0);
+}
+
 // What is actually on the wire right now, pulsing included.
 uint8_t hazeLevel() {
   if (cfg.pulseMode && !cfg.stopped && !purging() && !calibrating())
@@ -819,6 +848,8 @@ void loop() {
 
   // Unconditional: frames keep going out at zero as well, so a receiver never
   // sees signal loss just because the haze is off.
+  updateLed();
+
   if (now - lastDmx >= DMX_INTERVAL_MS) {
     lastDmx = now;
     const Fixture &f = FIXTURES[cfg.fixture];
