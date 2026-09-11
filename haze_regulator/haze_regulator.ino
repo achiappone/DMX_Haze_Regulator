@@ -60,8 +60,8 @@ const Fixture FIXTURES[] = {
 struct {
   bool automatic = true;
   uint8_t manual = 0;    // 0-100%
-  int setpoint = 150;    // target PM2.5 ug/m3
-  int deadband = 10;     // no output until this far below setpoint
+  float setpoint = 150.0f;  // target PM2.5 ug/m3; fractional for very light haze
+  float deadband = 10.0f;   // no output until this far below setpoint
   float gain = 1.0f;     // output % per ug/m3 of error
   int slew = 3;          // max % change per second
   int fan = 50;          // 0-100%, independent of haze regulation
@@ -234,7 +234,7 @@ bool pmFiltInit = false;
 uint16_t pkSes = 0, pkAll = 0, pkOut = 0;
 uint32_t pkSesAt = 0, pkAllBoot = 0, pkAllAt = 0;
 unsigned long pkLogged = 0;
-int predicted = 0;
+float predicted = 0;
 unsigned long outSince = 0;
 int pmAtOutStart = 0;
 bool noResponse = false;
@@ -307,7 +307,7 @@ bool riseLockNext(bool cur, float slope, int cut) {
 // measurement itself is already below the band: a lagging filter can show a
 // rising trend while the room is in fact emptying, and acting on that starves
 // the room exactly when it needs haze.
-int controlPm(int predicted, int measured, int setpoint, int deadband) {
+float controlPm(float predicted, float measured, float setpoint, float deadband) {
   // Below the band, anticipation may still ease output off as levels climb back
   // toward target - that is how you stop before overshooting. What it must not
   // do is claim the room is already past target when the sensor says it is not.
@@ -318,9 +318,9 @@ int controlPm(int predicted, int measured, int setpoint, int deadband) {
 // Where PM2.5 will be once haze commanded now actually reaches the sensor.
 // Controlling on this instead of the present reading is what buys back the
 // dead time between opening the machine and seeing the result.
-int predict(int pm, float slopePerSec, int lookaheadSec) {
-  long p = pm + lroundf(slopePerSec * lookaheadSec);
-  return p < 0 ? 0 : (p > 2000 ? 2000 : (int)p);
+float predict(float pm, float slopePerSec, int lookaheadSec) {
+  float p = pm + slopePerSec * lookaheadSec;
+  return p < 0 ? 0 : (p > 2000 ? 2000 : p);
 }
 
 // Time-proportional output: instead of holding a low continuous level, run the
@@ -358,7 +358,7 @@ void calFinish() {
   cfg.leadFall = constrain(calDead, 0, 120);
   cfg.leadRise = constrain(calDead * 2, 0, 120);
   cfg.slew = constrain(100 / calDead, 1, 100);
-  if (calNoise > 0) cfg.deadband = constrain(calNoise, 2, 100);
+  if (calNoise > 0) cfg.deadband = constrain((float)calNoise, 2.0f, 100.0f);
   // Integral time tracks the room's own decay constant: integrate no faster
   // than the process can actually respond, or the loop winds itself up.
   if (calTau > 0) cfg.integralTi = constrain(calTau, 30, 1800);
@@ -372,13 +372,13 @@ void calFinish() {
     // reports - drives this formula to a gain so low the proportional band is
     // wider than the setpoint, and output rounds to nothing until levels are
     // far below target. Insist on reaching full output by half the setpoint.
-    float minGain = 100.0f / max(20, cfg.setpoint / 2);
+    float minGain = 100.0f / max(20.0f, cfg.setpoint / 2.0f);
     if (cfg.gain < minGain) cfg.gain = minGain;
   }
   snprintf(calMsg, sizeof(calMsg),
-           "pulse %ds dead %ds rise %.1f decay %ds -> lead %d/%d slew %d gain %.1f band %d",
+           "pulse %ds dead %ds rise %.1f decay %ds -> lead %d/%d slew %d gain %.1f band %.2f",
            calPulseUsed, calDead, calRise, calTau, cfg.leadFall, cfg.leadRise,
-           cfg.slew, cfg.gain, cfg.deadband);
+           cfg.slew, cfg.gain, (double)cfg.deadband);
   if (calBaseHigh)
     strncat(calMsg, " (hazy baseline: rise may be understated)",
             sizeof(calMsg) - strlen(calMsg) - 1);
@@ -466,8 +466,8 @@ void runCalibration(unsigned long now, int pm) {
 void saveCfg() {
   prefs.putBool("auto", cfg.automatic);
   prefs.putUChar("manual", cfg.manual);
-  prefs.putInt("setpoint", cfg.setpoint);
-  prefs.putInt("deadband", cfg.deadband);
+  prefs.putFloat("setpoint", cfg.setpoint);
+  prefs.putFloat("deadband", cfg.deadband);
   prefs.putFloat("gain", cfg.gain);
   prefs.putInt("slew", cfg.slew);
   prefs.putInt("fan", cfg.fan);
@@ -492,8 +492,8 @@ void saveCfg() {
 void loadCfg() {
   cfg.automatic = prefs.getBool("auto", cfg.automatic);
   cfg.manual = prefs.getUChar("manual", cfg.manual);
-  cfg.setpoint = prefs.getInt("setpoint", cfg.setpoint);
-  cfg.deadband = prefs.getInt("deadband", cfg.deadband);
+  cfg.setpoint = prefs.getFloat("setpoint", cfg.setpoint);
+  cfg.deadband = prefs.getFloat("deadband", cfg.deadband);
   cfg.gain = prefs.getFloat("gain", cfg.gain);
   cfg.slew = prefs.getInt("slew", cfg.slew);
   cfg.fan = prefs.getInt("fan", cfg.fan);
@@ -519,8 +519,8 @@ void loadCfg() {
       constrain(cfg.dmxAddress, 1, maxAddress(FIXTURES[cfg.fixture].chans));
   cfg.manual = constrain(cfg.manual, 0, 100);
   cfg.fan = constrain(cfg.fan, 0, 100);
-  cfg.setpoint = constrain(cfg.setpoint, 0, 1000);
-  cfg.deadband = constrain(cfg.deadband, 0, 100);
+  cfg.setpoint = constrain(cfg.setpoint, 0.0f, 1000.0f);
+  cfg.deadband = constrain(cfg.deadband, 0.0f, 100.0f);
   cfg.gain = constrain(cfg.gain, 0.1f, 10.0f);
   cfg.slew = constrain(cfg.slew, 1, 100);
   cfg.leadFall = constrain(cfg.leadFall, 0, 120);
@@ -544,9 +544,9 @@ void loadCfg() {
 // Anti-windup is conditional integration: stop accumulating whenever the output
 // is already pinned at a limit and the error pushes it further that way. Without
 // it the integral charges through a long saturation and then will not let go.
-uint8_t computePI(int setpoint, int pm25, int deadband, float gain, int ti,
+uint8_t computePI(float setpoint, float pm25, float deadband, float gain, int ti,
                   float &acc) {
-  int err = setpoint - pm25;
+  float err = setpoint - pm25;
   if (err > deadband) err -= deadband;
   else if (err < -deadband) err += deadband;
   else err = 0;
@@ -565,7 +565,7 @@ uint8_t computePI(int setpoint, int pm25, int deadband, float gain, int ti,
 }
 
 // Proportional-only wrapper, used by the tests.
-uint8_t computeOutput(int setpoint, int pm25, int deadband, float gain) {
+uint8_t computeOutput(float setpoint, float pm25, float deadband, float gain) {
   float ignore = 0;
   return computePI(setpoint, pm25, deadband, gain, 0, ignore);
 }
@@ -677,6 +677,8 @@ details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
 #savebtn{margin-left:auto}
+#spnum{width:92px}
+#setpoint{flex:1}
 #pkclr{padding:2px 8px;font-size:11px;margin-left:auto}
 .dim{opacity:.32}
 #evt{max-height:230px;overflow:auto;font:11px ui-monospace,Menlo,monospace;
@@ -720,7 +722,9 @@ input:disabled{cursor:not-allowed}
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
-<label>Target haze <span id=vsp></span> ug/m3</label><input type=range id=setpoint min=0 max=1000 oninput="post('setpoint',this.value)">
+<label>Target haze <span id=vsp></span> ug/m3</label>
+<div class=row><input type=range id=setpoint min=0 max=400 step=0.25 oninput="post('setpoint',this.value)">
+<input type=number id=spnum min=0 max=400 step=0.25 onchange="post('setpoint',this.value)"></div>
 <details><summary>Tuning</summary>
 <div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<5?0:1)">Calibrate</button>
 <select id=calpulse onchange="post('calpulse',this.value)">
@@ -879,7 +883,11 @@ async function tick(){
     s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
     (s.pm25>=990?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
-  vman.textContent=s.manual; vsp.textContent=s.setpoint; vdb.textContent=s.deadband;
+  // Two decimals only where they carry information - a 0.75 target is a real
+  // setting, "150.00" is just noise.
+  const ug=v=>v<10?(+v).toFixed(2).replace(/0+$/,'').replace(/\.$/,''):Math.round(v);
+  vman.textContent=s.manual; vsp.textContent=ug(s.setpoint);
+  vdb.textContent=ug(s.deadband);
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
   vtau.textContent=s.tau; vtail.textContent=s.tail; vfloor.textContent=s.floor;
@@ -909,8 +917,10 @@ async function tick(){
   purge.className=purging?'on':'';
   dmxaddr.max=s.maxaddr;
   if(document.activeElement!=fixture)fixture.value=s.fixture;
-  if(!touching){manual.value=s.manual;setpoint.value=s.setpoint;
+  if(document.activeElement!=spnum)spnum.value=s.setpoint;
+  if(!touching){manual.value=s.manual;
     deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
+    setpoint.value=s.setpoint;
     tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;risecut.value=s.risecut;
     ti.value=s.ti;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
     pperiod.value=s.pperiod;pminon.value=s.pminon;}
@@ -981,11 +991,11 @@ void handleState() {
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"aqi\":%u,\"c03\":%u,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
-           "\"setpoint\":%d,\"deadband\":%d,\"gain\":%.1f,\"slew\":%d,"
+           "\"setpoint\":%.2f,\"deadband\":%.2f,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"risecut\":%d,\"riselock\":%s,\"ti\":%d,\"integ\":%.1f,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
-           "\"slope\":%.2f,\"predicted\":%d,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
+           "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
@@ -1127,7 +1137,8 @@ void handleHistory() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
   char hd[80];
-  snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%d,\"t\":[", nF + nC, cfg.setpoint);
+  snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%.2f,\"t\":[", nF + nC,
+           (double)cfg.setpoint);
   server.sendContent(hd);
   for (int field = 0; field < 4; field++) {
     if (field) server.sendContent(field == 1   ? "],\"pm\":["
@@ -1209,8 +1220,16 @@ void handleSet() {
     if (was != cfg.automatic) logEvent("mode -> %s", cfg.automatic ? "AUTO" : "MANUAL");
   }
   if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
-  if (server.hasArg("setpoint")) cfg.setpoint = constrain(server.arg("setpoint").toInt(), 0, 1000);
-  if (server.hasArg("deadband")) cfg.deadband = constrain(server.arg("deadband").toInt(), 0, 100);
+  if (server.hasArg("setpoint")) {
+    float was = cfg.setpoint;
+    cfg.setpoint = constrain(server.arg("setpoint").toFloat(), 0.0f, 1000.0f);
+    // A material target change invalidates the accumulated integral: it was
+    // charged to hold a different level, and at a several-minute integral time
+    // it would otherwise keep commanding the old one long after the change.
+    if (fabsf(cfg.setpoint - was) > fmaxf(2.0f, was * 0.1f)) integ = 0;
+  }
+  if (server.hasArg("deadband"))
+    cfg.deadband = constrain(server.arg("deadband").toFloat(), 0.0f, 100.0f);
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
   if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
   if (server.hasArg("leadfall"))
@@ -1479,10 +1498,9 @@ void loop() {
                             : slopeOf(pmHist[(pmIdx - 1 + SLOPE_WIN) % SLOPE_WIN],
                                       pmHist[(pmIdx - pmCount + SLOPE_WIN) % SLOPE_WIN],
                                       pmCount);
-      predicted = predict((int)lroundf(pmFilt), pmSlope,
+      predicted = predict(pmFilt, pmSlope,
                           leadFor(pmSlope, cfg.leadFall, cfg.leadRise));
-      predicted = controlPm(predicted, (int)lroundf(pmFilt), cfg.setpoint,
-                            cfg.deadband);
+      predicted = controlPm(predicted, pmFilt, cfg.setpoint, cfg.deadband);
     }
     // A pegged sensor cannot report a trend, so the regulator is flying blind
     // and any output it commands is guesswork. Clear the air instead. Not during
@@ -1529,8 +1547,7 @@ void loop() {
       // Insurance against a wrong trend estimate: whatever the prediction says,
       // never command nothing while the sensor reports the room well below
       // target. Being wrong downward means an empty room mid-show.
-      if ((int)lroundf(pmFilt) < cfg.setpoint - 3 * cfg.deadband &&
-          target < cfg.floorPct)
+      if (pmFilt < cfg.setpoint - 3 * cfg.deadband && target < cfg.floorPct)
         target = cfg.floorPct;
       riseLock = riseLockNext(riseLock, pmSlope, cfg.riseCut);
       if (riseLock) target = 0;  // beats the floor: do not feed a rising room
