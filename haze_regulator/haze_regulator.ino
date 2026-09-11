@@ -783,6 +783,11 @@ input:disabled{cursor:not-allowed}
 </details>
 <script>
 let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
+// Two decimals only where they carry information - a 0.75 target is a real
+// setting, "150.00" is just noise. Declared as a function, not a const: tick()
+// calls it above the point a const would be declared, and a const in its
+// temporal dead zone throws and aborts the rest of the update.
+function ug(v){return v<10?(+v).toFixed(2).replace(/0+$/,'').replace(/\.$/,''):Math.round(v)}
 document.querySelectorAll('input[type=range]').forEach(e=>{
   e.onpointerdown=()=>touching=1; e.onpointerup=()=>touching=0;});
 // Coalesce changes into one request and refresh straight after, so a button
@@ -903,9 +908,6 @@ async function tick(){
     s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
     (s.pm25>=990?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
-  // Two decimals only where they carry information - a 0.75 target is a real
-  // setting, "150.00" is just noise.
-  const ug=v=>v<10?(+v).toFixed(2).replace(/0+$/,'').replace(/\.$/,''):Math.round(v);
   vman.textContent=s.manual; vsp.textContent=ug(s.setpoint);
   vdb.textContent=ug(s.deadband);
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
