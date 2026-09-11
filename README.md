@@ -84,11 +84,32 @@ Manual Rev. 3, "DMX Values".
 
 **Avoid GPIO33-37** - wired to the module's 8MB octal PSRAM. GPIO26-32 are flash.
 
+## Everyday commands
+
+    npm run ota       # build and push over wifi - the normal path
+    npm run build     # compile only
+    npm run usb       # compile and flash over USB
+    npm run monitor   # serial monitor
+    npm run state     # current readings and settings
+    npm run logs      # event log
+    npm run csv       # download the last hour as CSV
+    npm run stop      # engage STOP
+    npm run go        # release STOP
+    npm run open      # open the control page
+
+Host, serial port and FQBN live in the `config` block of package.json.
+
+Wifi updates need a build that already contains the /update endpoint, so the
+first install of it has to go over USB. After that USB is only needed if an
+update leaves the board unable to join wifi.
+
 ## Build
 
     cp haze_regulator/secrets.h.example haze_regulator/secrets.h   # then fill in
-    arduino-cli compile -b esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M \
-      -u -p /dev/cu.usbmodem2121301 haze_regulator
+    npm run usb
+
+The FQBN is `esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi`.
+PSRAM holds the high-resolution trend buffer.
 
 `CDCOnBoot=cdc` is required: the board's native USB-Serial/JTAG port is the only
 one connected, so without it `Serial` goes to UART0 (GPIO43/44) and you see nothing.
