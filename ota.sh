@@ -10,7 +10,7 @@ trap 'rm -rf "$OUT"' EXIT
 arduino-cli compile --warnings all -b "$FQBN" --output-dir "$OUT" haze_regulator
 BIN="$OUT/haze_regulator.ino.bin"
 echo "uploading $(wc -c < "$BIN") bytes to $HOST"
-curl -f --no-progress-meter --max-time 300 -F "firmware=@$BIN" "http://$HOST/update"
+curl -f --netrc --no-progress-meter --max-time 300 -F "firmware=@$BIN" "http://$HOST/update"
 echo
 
 # A build that dies in setup() never reaches WiFi, so it cannot be reflashed
@@ -20,9 +20,9 @@ echo "waiting for $HOST to come back"
 i=0
 while [ $i -lt 30 ]; do
   sleep 2
-  if curl -fs --max-time 3 "http://$HOST/api/state" > /dev/null 2>&1; then
+  if curl -fs --netrc --max-time 3 "http://$HOST/api/state" > /dev/null 2>&1; then
     echo "back up"
-    curl -fs --max-time 5 "http://$HOST/api/events" 2>/dev/null \
+    curl -fs --netrc --max-time 5 "http://$HOST/api/events" 2>/dev/null \
       | grep -i selftest && echo "^^ self-test failures - fix before trusting this build" || true
     exit 0
   fi

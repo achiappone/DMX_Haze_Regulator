@@ -13,11 +13,11 @@
     "ota": "./ota.sh $npm_package_config_host",
     "usb": "arduino-cli compile --warnings all -b $npm_package_config_fqbn -u -p $npm_package_config_port haze_regulator",
     "monitor": "arduino-cli monitor -p $npm_package_config_port -c baudrate=115200",
-    "state": "curl -s --max-time 8 http://$npm_package_config_host/api/state | python3 -m json.tool",
-    "logs": "curl -s --max-time 8 http://$npm_package_config_host/api/events",
-    "csv": "curl -s --max-time 30 -OJ 'http://$npm_package_config_host/api/csv?win=3600' && echo saved haze_trend.csv",
-    "stop": "curl -s 'http://$npm_package_config_host/api/set?stop=1' && echo STOP engaged",
-    "go": "curl -s 'http://$npm_package_config_host/api/set?stop=0' && echo STOP released",
+    "state": "curl -s --netrc --max-time 8 http://$npm_package_config_host/api/state | python3 -m json.tool",
+    "logs": "curl -s --netrc --max-time 8 http://$npm_package_config_host/api/events",
+    "csv": "curl -s --netrc --max-time 30 -OJ 'http://$npm_package_config_host/api/csv?win=3600' && echo saved haze_trend.csv",
+    "stop": "curl -s --netrc 'http://$npm_package_config_host/api/set?stop=1' && echo STOP engaged",
+    "go": "curl -s --netrc 'http://$npm_package_config_host/api/set?stop=0' && echo STOP released",
     "open": "open http://$npm_package_config_host/",
     "bin": "arduino-cli compile --warnings all -b $npm_package_config_fqbn --output-dir build haze_regulator && echo && ls -lh build/haze_regulator.ino.bin"
   }

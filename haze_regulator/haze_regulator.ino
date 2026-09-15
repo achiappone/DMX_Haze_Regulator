@@ -1100,7 +1100,21 @@ uint8_t hazeLevel() {
   return output;
 }
 
+// Every endpoint, not just the writing ones. This board is published at
+// haze.anthonychiappone.com now, so "anyone who can reach the control page can
+// already drive the hazer" stopped being a statement about the office LAN.
+// Basic auth over plain HTTP on the LAN is weak, but the tunnel terminates TLS
+// at the edge and this is what stops an unauthenticated /update from the
+// public internet. ponytail: swap for Cloudflare Access + a service token if
+// the credentials ever need rotating without a flash.
+bool authOk() {
+  if (server.authenticate(WEB_USER, WEB_PASS)) return true;
+  server.requestAuthentication();
+  return false;
+}
+
 void handleState() {
+  if (!authOk()) return;
   char buf[1560];
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"c03\":%u,\"rssi\":%d,\"up\":%lu,"
@@ -1195,6 +1209,7 @@ void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first)
 }
 
 void handleHistory() {
+  if (!authOk()) return;
   if (server.hasArg("clearpeaks")) {
     pkSes = pkOut = pkAll = 0;
     pkSesAt = pkAllBoot = pkAllAt = 0;
@@ -1269,6 +1284,7 @@ void handleHistory() {
 }
 
 void handleEvents() {
+  if (!authOk()) return;
   if (server.hasArg("clear")) {
     if (fsOk) LittleFS.remove(EVT_PATH);
     logEvent("log cleared");
@@ -1295,6 +1311,7 @@ void handleEvents() {
 }
 
 void handleCsv() {
+  if (!authOk()) return;
   int win = server.hasArg("win") ? server.arg("win").toInt() : 600;
   win = constrain(win, 30, 604800);
   bool fine = pickFine(win);
@@ -1330,6 +1347,7 @@ void handleCsv() {
 }
 
 void handleSet() {
+  if (!authOk()) return;
   if (server.hasArg("automatic")) {
     bool was = cfg.automatic;
     cfg.automatic = server.arg("automatic").toInt();
@@ -1517,7 +1535,10 @@ void setup() {
     wifiLostAt = millis();
   }
 
-  server.on("/", []() { server.send_P(200, "text/html", PAGE); });
+  server.on("/", []() {
+    if (!authOk()) return;
+    server.send_P(200, "text/html", PAGE);
+  });
   server.on("/api/state", handleState);
   server.on("/api/history", handleHistory);
   server.on("/api/csv", handleCsv);
@@ -1530,6 +1551,7 @@ void setup() {
   server.on(
       "/update", HTTP_POST,
       []() {
+        if (!authOk()) return;
         bool ok = !Update.hasError();
         server.sendHeader("Connection", "close");
         server.send(200, "text/plain", ok ? "OK - rebooting" : "FAILED");
@@ -1540,6 +1562,9 @@ void setup() {
         }
       },
       []() {
+        // Runs while the body streams in, before the handler above. Without
+        // this check the flash write happens and only the response is refused.
+        if (!server.authenticate(WEB_USER, WEB_PASS)) return;
         HTTPUpload &up = server.upload();
         if (up.status == UPLOAD_FILE_START) {
           logEvent("firmware upload started: %s", up.filename.c_str());
