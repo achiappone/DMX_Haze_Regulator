@@ -32,6 +32,14 @@
 #define NORESP_PCT 10      // below this no measurable rise is expected anyway
 #define NORESP_WIN_S 90    // commanded this long before judging
 #define NORESP_RISE 15     // ug/m3 that counts as the machine responding
+// Bumped by hand in the same commit as the change, matching the scheme
+// pve-stack uses. The build stamp comes from the compiler rather than a
+// constant anyone has to remember: the question this footer answers is "is the
+// board running the push I just made", and a version alone cannot answer it
+// when a flash silently fails and leaves the old binary in place.
+#define FW_VERSION "1.00.001"
+#define FW_BUILT __DATE__ " " __TIME__
+
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
 #define SAT_COUNT 60000   // 0.3um count field is 16-bit and saturates near here
 #define SAT_PURGE_MIN_MS 15000   // first response to saturation
@@ -114,7 +122,8 @@ bool calibrating() { return calState >= CAL_PURGE && calState <= CAL_DECAY; }
 // data rather than a fresh start. Two tiers: 2Hz detail (fast enough that pulse
 // bursts are not aliased away) and 1-minute averages for the long windows.
 struct Sample {
-  uint16_t pm;
+  uint16_t pm;    // PM2.5 mass, always, so the chart keeps one stable unit
+  uint16_t ctrl;  // what the loop actually regulated on, in ctrlValue() units
   uint8_t out;
   uint8_t act;
 };
@@ -129,7 +138,7 @@ int fineN = 0, fineHead = 0, coarseN = 0, coarseHead = 0;
 // into the current session's timeline, which put them out of order.
 int coarsePostBoot = 0;
 unsigned long histLast = 0, coarseLast = 0;
-uint32_t cAccPm = 0, cAccOut = 0, cAccAct = 0;
+uint32_t cAccPm = 0, cAccCtrl = 0, cAccOut = 0, cAccAct = 0;
 int cAccN = 0;
 
 // Only built-in types in the signature: the Arduino preprocessor inserts
@@ -138,7 +147,12 @@ int cAccN = 0;
 // The minute tier is mirrored to flash so the trend survives a reboot, a
 // reflash, or the venue killing power. Appending 4 bytes a minute keeps the
 // write load trivial; the file is rotated only once it holds twice the ring.
-#define TREND_PATH "/trend.bin"
+// v2: 6-byte records carrying the control signal alongside the mass reading.
+// A new path rather than a version byte - the old 4-byte file would parse as
+// garbage at 6 bytes a record, and silently wrong history is worse than none.
+#define TREND_PATH "/trend2.bin"
+#define TREND_PATH_V1 "/trend.bin"
+#define TREND_REC 6
 #define EVT_PATH "/events.log"
 #define EVT_MAX 196608  // 192KB, months of transitions
 bool fsOk = false;
@@ -190,19 +204,21 @@ void logEvent(const char *fmt, ...) {
 }
 
 
-void trendAppend(uint16_t pm, uint8_t out, uint8_t act) {
+void trendAppend(uint16_t pm, uint16_t ctrl, uint8_t out, uint8_t act) {
   if (!fsOk) return;
   File f = LittleFS.open(TREND_PATH, "a");
   if (!f) return;
-  uint8_t rec[4] = {(uint8_t)(pm & 0xFF), (uint8_t)(pm >> 8), out, act};
-  f.write(rec, 4);
+  uint8_t rec[TREND_REC] = {(uint8_t)(pm & 0xFF), (uint8_t)(pm >> 8),
+                            (uint8_t)(ctrl & 0xFF), (uint8_t)(ctrl >> 8),
+                            out, act};
+  f.write(rec, TREND_REC);
   size_t sz = f.size();
   f.close();
-  if (sz / 4 <= (size_t)coarseCap * 2) return;
+  if (sz / TREND_REC <= (size_t)coarseCap * 2) return;
 
   File in = LittleFS.open(TREND_PATH, "r");
   if (!in) return;
-  in.seek((in.size() / 4 - coarseCap) * 4);
+  in.seek((in.size() / TREND_REC - coarseCap) * TREND_REC);
   File out2 = LittleFS.open("/trend.tmp", "w");
   if (!out2) { in.close(); return; }
   uint8_t buf[256];
@@ -214,15 +230,15 @@ void trendAppend(uint16_t pm, uint8_t out, uint8_t act) {
   LittleFS.rename("/trend.tmp", TREND_PATH);
 }
 
-void histPush(bool coarse, uint16_t pm, uint8_t out, uint8_t act) {
+void histPush(bool coarse, uint16_t pm, uint16_t ctrl, uint8_t out, uint8_t act) {
   if (coarse) {
     if (!coarseBuf) return;
-    coarseBuf[coarseHead] = {pm, out, act};
+    coarseBuf[coarseHead] = {pm, ctrl, out, act};
     coarseHead = (coarseHead + 1) % coarseCap;
     if (coarseN < coarseCap) coarseN++;
   } else {
     if (!fineBuf) return;
-    fineBuf[fineHead] = {pm, out, act};
+    fineBuf[fineHead] = {pm, ctrl, out, act};
     fineHead = (fineHead + 1) % fineCap;
     if (fineN < fineCap) fineN++;
   }
@@ -750,6 +766,7 @@ background:#141414;color:#eee;border:1px solid #2e2e2e;border-radius:14px;
 box-shadow:0 2px 18px #0008}
 .c{background:#1e1e1e}
 h1{font-size:17px;margin:0 0 12px}
+.ver{margin:18px 0 0;text-align:center;color:#666;font-size:12px}
 .g{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px;margin-bottom:14px}
 .c{background:#1c1c1c;border-radius:8px;padding:10px}
 .c b{display:block;font-size:22px}.c span{color:#999;font-size:12px}
@@ -867,6 +884,7 @@ input:disabled{cursor:not-allowed}
 <label>DMX start address</label>
 <input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
 </details>
+<div class=ver>v)HTML" FW_VERSION R"HTML( &middot; built )HTML" FW_BUILT R"HTML(</div>
 <script>
 let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
 // Two decimals only where they carry information - a 0.75 target is a real
@@ -1199,7 +1217,8 @@ void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first)
       v = (coarse ? coarseAgeMs(k) : (long)k * per) / 100;  // tenths of a second
     else if (field == 1) v = buf[idx].pm;
     else if (field == 2) v = buf[idx].out;
-    else v = buf[idx].act;
+    else if (field == 3) v = buf[idx].act;
+    else v = buf[idx].ctrl;
     if (!first) chunk += ',';
     first = false;
     chunk += v;
@@ -1222,7 +1241,7 @@ void handleHistory() {
   }
   if (server.hasArg("clear")) {
     fineN = fineHead = coarseN = coarseHead = coarsePostBoot = 0;
-    cAccPm = cAccOut = cAccAct = 0;
+    cAccPm = cAccCtrl = cAccOut = cAccAct = 0;
     cAccN = 0;
     if (fsOk) LittleFS.remove(TREND_PATH);
     logEvent("trend history cleared");
@@ -1271,10 +1290,13 @@ void handleHistory() {
   snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%.2f,\"t\":[", nF + nC,
            (double)cfg.setpoint);
   server.sendContent(hd);
-  for (int field = 0; field < 4; field++) {
+  // ctrl is appended last so existing keys keep their meaning and a page
+  // served from an older cache still finds pm/out/act where it expects them.
+  for (int field = 0; field < 5; field++) {
     if (field) server.sendContent(field == 1   ? "],\"pm\":["
                                   : field == 2 ? "],\"out\":["
-                                               : "],\"act\":[");
+                                  : field == 3 ? "],\"act\":["
+                                               : "],\"ctrl\":[");
     bool first = true;
     if (nC) emitRange(true, coarseSkip, nC, stepC, field, first);
     if (nF) emitRange(false, 0, nF, stepF, field, first);
@@ -1326,16 +1348,17 @@ void handleCsv() {
   server.sendHeader("Content-Disposition", "attachment; filename=haze_trend.csv");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  server.sendContent("seconds_ago,pm25_ugm3,demand_pct,wire_pct\n");
+  server.sendContent("seconds_ago,pm25_ugm3,ctrl,demand_pct,wire_pct\n");
   int newest = (head - 1 + cap) % cap;
   String chunk;
   chunk.reserve(1400);
   for (int i = want - 1; i >= 0; i--) {
     int idx = ((newest - i) % cap + cap) % cap;
     long ms = (long)i * perMs;  // 2Hz samples need a decimal, or rows collide
-    char row[48];
-    snprintf(row, sizeof(row), "%ld.%01ld,%u,%u,%u\n", ms / 1000,
-             (ms % 1000) / 100, buf[idx].pm, buf[idx].out, buf[idx].act);
+    char row[56];
+    snprintf(row, sizeof(row), "%ld.%01ld,%u,%u,%u,%u\n", ms / 1000,
+             (ms % 1000) / 100, buf[idx].pm, buf[idx].ctrl, buf[idx].out,
+             buf[idx].act);
     chunk += row;
     if (chunk.length() > 1200) {
       server.sendContent(chunk);
@@ -1481,13 +1504,32 @@ void setup() {
   if (fsOk) {
     File f = LittleFS.open(TREND_PATH, "r");
     if (f) {
-      size_t recs = f.size() / 4;
+      size_t recs = f.size() / TREND_REC;
       size_t skip = recs > (size_t)coarseCap ? recs - coarseCap : 0;
-      f.seek(skip * 4);
-      uint8_t rec[4];
-      while (f.read(rec, 4) == 4)
-        histPush(true, (uint16_t)(rec[0] | (rec[1] << 8)), rec[2], rec[3]);
+      f.seek(skip * TREND_REC);
+      uint8_t rec[TREND_REC];
+      while (f.read(rec, TREND_REC) == TREND_REC)
+        histPush(true, (uint16_t)(rec[0] | (rec[1] << 8)),
+                 (uint16_t)(rec[2] | (rec[3] << 8)), rec[4], rec[5]);
       f.close();
+    }
+    // Carry the v1 file across rather than dropping it: it has no control
+    // signal, but its mass readings are real history and throwing away days of
+    // trend to add a column is a bad trade. Pre-upgrade samples read ctrl 0,
+    // which is why the chart must not draw ctrl where it was never recorded.
+    if (!coarseN && LittleFS.exists(TREND_PATH_V1)) {
+      File v1 = LittleFS.open(TREND_PATH_V1, "r");
+      if (v1) {
+        size_t recs = v1.size() / 4;
+        size_t skip = recs > (size_t)coarseCap ? recs - coarseCap : 0;
+        v1.seek(skip * 4);
+        uint8_t r1[4];
+        while (v1.read(r1, 4) == 4)
+          histPush(true, (uint16_t)(r1[0] | (r1[1] << 8)), 0, r1[2], r1[3]);
+        v1.close();
+        Serial.printf("imported %d minutes from the v1 trend file\n", coarseN);
+      }
+      LittleFS.remove(TREND_PATH_V1);
     }
     Serial.printf("trend restored from flash: %d minutes\n", coarseN);
   } else {
@@ -1813,20 +1855,24 @@ void loop() {
   if (now - histLast >= HIST_FINE_MS) {
     histLast = now;
     uint16_t pm = everRead ? data.pm25_env : 0;
+    // Rounded, not truncated: at source=1 this is a count/100, so a unit here
+    // is 100 particles and dropping the fraction biases the whole trend low.
+    uint16_t ctrl = (uint16_t)lroundf(ctrlValue());
     uint8_t act = hazeLevel();
-    histPush(false, pm, output, act);
+    histPush(false, pm, ctrl, output, act);
     cAccPm += pm;
+    cAccCtrl += ctrl;
     cAccOut += output;
     cAccAct += act;
     cAccN++;
     if (now - coarseLast >= HIST_COARSE_MS && cAccN) {
       coarseLast = now;
-      uint16_t cpm = cAccPm / cAccN;
+      uint16_t cpm = cAccPm / cAccN, cctrl = cAccCtrl / cAccN;
       uint8_t co = cAccOut / cAccN, ca = cAccAct / cAccN;
-      histPush(true, cpm, co, ca);
+      histPush(true, cpm, cctrl, co, ca);
       if (coarsePostBoot < coarseCap) coarsePostBoot++;
-      trendAppend(cpm, co, ca);
-      cAccPm = cAccOut = cAccAct = 0;
+      trendAppend(cpm, cctrl, co, ca);
+      cAccPm = cAccCtrl = cAccOut = cAccAct = 0;
       cAccN = 0;
     }
   }
