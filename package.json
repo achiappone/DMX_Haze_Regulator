@@ -5,7 +5,7 @@
   "description": "PM2.5-regulated DMX haze controller on an ESP32-S3",
   "config": {
     "fqbn": "esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi",
-    "host": "haze.local",
+    "host": "10.20.5.52",
     "port": "/dev/cu.usbmodem2121301"
   },
   "scripts": {
