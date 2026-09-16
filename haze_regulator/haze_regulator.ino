@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.12.000"
+#define FW_VERSION "1.13.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -290,6 +290,26 @@ int pmCount = 0, pmIdx = 0;
 float pmSlope = 0;   // ug/m3 per second, negative when haze is clearing
 float pmFilt = 0;
 float integ = 0;  // integral contribution, in output percent
+
+// A planned reboot throws the integral away, and on a process with a 64s dead
+// time and an 89s integral time that costs minutes of recovery every update -
+// output restarts at zero and climbs at the slew limit while the room drains.
+// It is worth carrying across a reboot we chose to make, but only briefly: an
+// integral is a statement about a room that no longer holds once the board has
+// been off long enough for the haze to clear.
+#define INTEG_KEEP_S 300
+void saveInteg() {
+  prefs.putFloat("integ", integ);
+  prefs.putUInt("integAt", (uint32_t)time(nullptr));
+}
+void restoreInteg() {
+  uint32_t at = prefs.getUInt("integAt", 0);
+  uint32_t now = (uint32_t)time(nullptr);
+  if (!at || now < 1700000000 || now - at > INTEG_KEEP_S) return;
+  integ = constrain(prefs.getFloat("integ", 0.0f), 0.0f, 100.0f);
+  logEvent("integral %.1f restored after a %us restart", (double)integ,
+           (unsigned)(now - at));
+}
 bool pmFiltInit = false;
 // Peak tracking. Session peaks reset on boot; the all-time peak is kept in NVS
 // with the boot and uptime it happened at, so it can be found in the event log.
@@ -1277,22 +1297,35 @@ function draw(){
   // The band the loop actually holds. Drawn as a region rather than two lines
   // because the useful question is "is the trace inside it", not "where are
   // the edges" - and a filled band answers that at a glance while scrolling.
-  if(hi>lo){const yh=Ypm(hi),yl=Ypm(lo);
-    // Judged on the regulated signal, not on PM2.5: the band is expressed in
-    // whatever the loop controls, and colouring it by a series it does not
-    // govern would call the loop wrong when it is holding its target exactly.
-    // Yellow is a warning while still inside - by the time a 64s dead time
-    // shows a breach the dose that caused it landed a minute ago.
+  // Judged on the regulated signal, not on PM2.5: the band is expressed in
+  // whatever the loop controls, and colouring it by a series it does not govern
+  // would call the loop wrong when it is holding its target exactly. Yellow is
+  // a warning while still inside - by the time a 64s dead time shows a breach,
+  // the dose that caused it landed a minute ago.
+  let zcol='#4a9966', zout=0, zw=hi-lo;
+  if(zw>0&&n){
     const cur=(H.ctrl&&H.ctrl.length?H.ctrl:H.pm)[n-1];
-    const w=hi-lo, out=Math.max(lo-cur,cur-hi,0), edge=Math.min(cur-lo,hi-cur);
-    const col = out>w*0.5 ? '#c05050'      // well out
-              : out>0     ? '#d08a3a'      // out
-              : edge<w*0.15 ? '#c9b458'    // inside, but drifting at an edge
-                            : '#4a9966';   // holding
-    ctx.fillStyle=col+'1e';ctx.fillRect(ML,yh,pw,yl-yh);
-    ctx.strokeStyle=col+'77';ctx.lineWidth=1;
+    zout=Math.max(lo-cur,cur-hi,0);
+    const edge=Math.min(cur-lo,hi-cur);
+    zcol = zout>zw*0.5 ? '#c05050'      // well out
+         : zout>0      ? '#d08a3a'      // out
+         : edge<zw*0.15 ? '#c9b458'     // inside, but drifting at an edge
+                        : '#4a9966';    // holding
+  }
+  if(hi>lo){const yh=Ypm(hi),yl=Ypm(lo);
+    ctx.fillStyle=zcol+'1e';ctx.fillRect(ML,yh,pw,yl-yh);
+    ctx.strokeStyle=zcol+'77';ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(ML,yh);ctx.lineTo(ML+pw,yh);
     ctx.moveTo(ML,yl);ctx.lineTo(ML+pw,yl);ctx.stroke();}
+  // Too much haze or too little both light the whole chart, so the state is
+  // readable from across a room without finding the trace first. The glow grows
+  // with the excursion rather than switching on flat, so a near miss and a
+  // runaway do not look the same. On the canvas element, not the canvas, so it
+  // survives the clearRect at the top of every redraw.
+  c.style.boxShadow = zout>0
+    ? '0 0 '+Math.round(Math.min(30,9+zout/zw*24))+'px #c05050'+
+      (zout>zw*0.5?'dd':'99')
+    : 'none';
   const spy=Ypm(sp);
   ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(ML,spy);ctx.lineTo(ML+pw,spy);ctx.stroke();
@@ -2032,6 +2065,9 @@ void setup() {
   pkAll = prefs.getUShort("pkall", 0);
   pkAllBoot = prefs.getUInt("pkallb", 0);
   pkAllAt = prefs.getUInt("pkallat", 0);
+  // After loadCfg, since it needs nothing from the config, but before the loop
+  // starts so the first control tick already has it.
+  restoreInteg();
   Serial.printf("fixture: %s, addr %d\n", FIXTURES[cfg.fixture].name,
                 cfg.dmxAddress);
 
@@ -2097,6 +2133,7 @@ void setup() {
         server.send(200, "text/plain", ok ? "OK - rebooting" : "FAILED");
         if (ok) {
           logEvent("firmware updated over wifi, rebooting");
+          saveInteg();
           delay(300);
           ESP.restart();
         }
@@ -2155,6 +2192,7 @@ void setup() {
         if (Update.end(true)) {
           server.send(200, "text/plain", "OK - rebooting");
           logEvent("firmware updated over wifi (chunked), rebooting");
+          saveInteg();
           delay(300);
           ESP.restart();
         } else {
@@ -2213,6 +2251,7 @@ void setup() {
     server.sendHeader("Connection", "close");
     server.send(200, "text/plain", "rebooting");
     logEvent("reboot requested over http");
+    saveInteg();
     delay(300);
     ESP.restart();
   });
