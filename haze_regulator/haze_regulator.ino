@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.06.001"
+#define FW_VERSION "1.07.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -430,6 +430,19 @@ void adaptTick(unsigned long now, float lvl, int duty) {
     saveAt = now + 2000;
   }
   adaptReset(now, lvl);
+}
+
+// What the room loses while a dose is in flight. A dose sized to exactly close
+// the gap arrives into a room that has been leaking the whole time, and at the
+// target - gap closed, nothing left to fill - the loop still has to replace
+// level/tau every second or the level falls straight back out of the band.
+// Holding a level is a rate, not a one-shot, and doseCap had no term for it:
+// measured here it allowed 5% while holding the band needed 12.1%, and the
+// integral could not rescue that because the cap clips output before the
+// integral ever reaches it.
+float holdLoss(float level, int tau, int deadTime) {
+  if (tau <= 0 || deadTime <= 0 || level <= 0) return 0.0f;
+  return level / tau * deadTime;
 }
 
 uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
@@ -876,6 +889,14 @@ void selfTest() {
   CHECK(doseCap(1000, 20.0f, 20, 100) == 100);   // huge deficit, still capped
   CHECK(doseCap(150, 0.0f, 20, 100) == 100);     // uncalibrated: no cap
   CHECK(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
+  // Replacing the leak. At the target with the gap closed the cap must still
+  // allow the maintenance rate, or the level cannot be held at all.
+  CHECK(fabsf(holdLoss(175, 89, 64) - 125.8f) < 0.5f);
+  CHECK(holdLoss(175, 0, 64) == 0.0f);   // no decay constant, no claim
+  CHECK(holdLoss(0, 89, 64) == 0.0f);    // empty room loses nothing
+  CHECK(doseCap(holdLoss(175, 89, 64), 16.22f, 64, 100) == 12);  // the 12.1% it needed
+  // And the old behaviour is unchanged where there is no decay to replace.
+  CHECK(doseCap(150 + holdLoss(0, 89, 20), 20.0f, 20, 100) == 38);
   // Adaptive rise. Holding level at 100 with 5% duty and a 400s decay means
   // the machine is replacing 0.25/s with 0.05 of its full output: 5.0/s.
   CHECK(fabsf(riseEstimate(100, 100, 100, 0.05f, 600, 400) - 5.0f) < 0.01f);
@@ -2205,7 +2226,8 @@ void loop() {
       // Applied after the floor: an anti-starvation minimum must not be able
       // to overshoot a target that is already nearly reached.
       uint8_t cap =
-          doseCap(deficitAtArrival(cfg.setpoint, pmFilt, pmSlope, cfg.deadTime),
+          doseCap(deficitAtArrival(cfg.setpoint, pmFilt, pmSlope, cfg.deadTime) +
+                      holdLoss(pmFilt, cfg.integralTi, cfg.deadTime),
                   cfg.riseRate, cfg.deadTime, cfg.dosePct);
       if (target > cap) target = cap;
 
