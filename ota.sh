@@ -99,7 +99,10 @@ while [ $i -lt 30 ]; do
             | sed -n 's/.*class=ver>v\([0-9.]*\).*/\1/p') || true
   if [ "$RUNNING" = "$VER" ]; then
     echo "back up on $VER"
+    # Only this boot's log. Grepping the whole file reports a failure that was
+    # fixed two flashes ago, which is worse than not checking at all.
     curl -fs --netrc --max-time 5 "http://$HOST/api/events" 2>/dev/null \
+      | awk '/ boot: /{out=""} {out = out $0 ORS} END{printf "%s", out}' \
       | grep -i selftest && echo "^^ self-test failures - fix before trusting this build" || true
     exit 0
   fi

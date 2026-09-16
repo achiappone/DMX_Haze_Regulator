@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.02.002"
+#define FW_VERSION "1.03.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -401,13 +401,26 @@ float predict(float pm, float slopePerSec, int lookaheadSec) {
 // The machine keeps hazing for a few seconds after DMX drops to zero, so a
 // commanded burst delivers its own length plus that tail. Shorten the command
 // by the tail, or every short pulse overshoots its intended duty.
+// The burst amplitude, given what is being asked for. level is a ceiling on
+// how hard a burst hits, not a fixed height: asking for more than the ceiling
+// means running continuously at the demand rather than diluting it.
+int burstLevel(int demand, int level) { return level < demand ? demand : level; }
+
+// Pulse with the on-time compensating for the amplitude, so the average
+// delivered is the demand either way. At level 100 a 14% demand is a 100%
+// slug for 14% of the cycle - which is what produces the spikes: the machine
+// dumps a full-power burst and the room sees it arrive all at once. At level
+// 20 the same 14% runs at 20% for 70% of the cycle. Same haze, spread out.
+// level 100 reduces exactly to the original behaviour.
 uint8_t dutyLevel(unsigned long ms, int demand, int period, int level, int tail) {
   if (demand <= 0) return 0;
   if (demand >= 100) return 100;
+  int lvl = burstLevel(demand, level);
   unsigned long per = (unsigned long)period * 1000;
-  long on = (long)(per * demand / 100) - (long)tail * 1000;
+  long on = (long)(per * demand / lvl) - (long)tail * 1000;
   if (on <= 0) return 0;  // cannot deliver this little; period must be longer
-  return (ms % per) < (unsigned long)on ? (uint8_t)level : 0;
+  if ((unsigned long)on > per) on = (long)per;
+  return (ms % per) < (unsigned long)on ? (uint8_t)lvl : 0;
 }
 
 // A fixture occupying n channels cannot start later than 513-n.
@@ -801,6 +814,15 @@ void selfTest() {
   CHECK(dutyLevel(999, 20, 10, 100, 1) == 100);    // 1s tail: command only 1s
   CHECK(dutyLevel(1001, 20, 10, 100, 1) == 0);
   CHECK(dutyLevel(500, 20, 10, 100, 3) == 0);      // tail alone exceeds the duty
+  // Amplitude-compensated pulsing: same average, gentler burst, longer on-time.
+  CHECK(burstLevel(14, 20) == 20);   // ceiling applies
+  CHECK(burstLevel(50, 20) == 50);   // asking for more than the ceiling wins
+  CHECK(dutyLevel(6999, 14, 10, 20, 0) == 20);   // 14/20 = 70% of a 10s cycle
+  CHECK(dutyLevel(7001, 14, 10, 20, 0) == 0);    // off after 7s
+  CHECK(dutyLevel(1399, 14, 10, 100, 0) == 100); // level 100: the old 1.4s slug
+  CHECK(dutyLevel(1401, 14, 10, 100, 0) == 0);
+  CHECK(dutyLevel(5000, 50, 10, 20, 0) == 50);   // demand above ceiling: continuous
+  CHECK(dutyLevel(9999, 50, 10, 20, 0) == 50);
   if (checkFails) Serial.printf("selfTest: %d CHECK(s) FAILED\n", checkFails);
   else Serial.println("selfTest ok");
 }
@@ -906,6 +928,8 @@ input:disabled{cursor:not-allowed}
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
+<label>Burst level <span id=vpl></span>% <i style=color:#888;font-size:12px>lower = gentler, longer bursts for the same haze</i></label>
+<input type=range id=plevel min=10 max=100 oninput="post('plevel',this.value)">
 <label>Dose limit <span id=vdose></span>% of deficit <i style=color:#666>(needs calibration; caps overshoot)</i></label><input type=range id=dosepct min=10 max=200 step=5 oninput="post('dosepct',this.value)">
 <div class=leg><i id=doseinfo></i></div>
 <label>Integral time <span id=vti></span>s <i style=color:#666>(0 = proportional only)</i></label><input type=range id=ti min=0 max=1800 step=10 oninput="post('ti',this.value)">
@@ -1084,7 +1108,7 @@ async function tick(){
     :'not calibrated - dose limit inactive, run Calibrate';
   integ.textContent=s.integ.toFixed(1); vlf.textContent=s.leadfall; vlr.textContent=s.leadrise;
   s_cal=s.cal; pulseOn=s.pulse; apOn=s.autopurge;
-  apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon;
+  apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon; vpl.textContent=s.plevel;
   pulsebtn.className=s.pulse?'on':'';
   const on=(s.pnow*s.output/100);
   pulsestat.textContent=s.pulse?(s.output>0&&s.output<100?
@@ -1114,7 +1138,7 @@ async function tick(){
     tgtminr.value=s.tgtmin;tgtmaxr.value=s.tgtmax;
     tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;risecut.value=s.risecut;
     ti.value=s.ti;dosepct.value=s.dosepct;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
-    pperiod.value=s.pperiod;pminon.value=s.pminon;}
+    pperiod.value=s.pperiod;pminon.value=s.pminon;plevel.value=s.plevel;}
   if(document.activeElement!=dmxaddr)dmxaddr.value=s.dmxaddr;
   draw();
 }
@@ -1138,7 +1162,10 @@ int calLeft() {
 int pulsePeriodNow() {
   if (!cfg.automatic || output <= 0) return cfg.pulsePeriod;
   // Long enough that a burst still lasts pulseMinOn after the tail is removed.
-  int per = ((cfg.pulseMinOn + cfg.machineTail) * 100 + output - 1) / output;
+  // Against the burst amplitude, not 100: a gentler burst is already longer for
+  // the same demand, so it needs less stretching to clear the minimum.
+  int lvl = burstLevel(output, cfg.pulseLevel);
+  int per = ((cfg.pulseMinOn + cfg.machineTail) * lvl + output - 1) / output;
   return constrain(per, 5, 120);
 }
 
@@ -1210,7 +1237,7 @@ void handleState() {
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
-           "\"pminon\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
+           "\"pminon\":%d,\"plevel\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
            (int)WiFi.RSSI(), (unsigned long)(millis() / 1000), output, target,
@@ -1233,7 +1260,7 @@ void handleState() {
            pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
-           cfg.pulseMinOn, cfg.autoPurge ? "true" : "false",
+           cfg.pulseMinOn, cfg.pulseLevel, cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
@@ -1535,6 +1562,8 @@ void handleSet() {
   }
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
   if (server.hasArg("autopurge")) cfg.autoPurge = server.arg("autopurge").toInt();
+  if (server.hasArg("plevel"))
+    cfg.pulseLevel = constrain(server.arg("plevel").toInt(), 10, 100);
   if (server.hasArg("pminon"))
     cfg.pulseMinOn = constrain(server.arg("pminon").toInt(), 1, 10);
   if (server.hasArg("calpulse"))
