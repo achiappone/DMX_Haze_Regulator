@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.06.000"
+#define FW_VERSION "1.06.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -370,7 +370,10 @@ struct Preset {
   int tau, plevel, dosePct, slew, riseCut;
 };
 const Preset PRESETS[] = {
-    {"Stable", 60, 20, 60, 1, 3},
+    // dose 100, not 60: doseCap already shrinks with the gap, so the loop backs
+    // off on its own as it approaches the band. A second handicap on top of it
+    // held the level ~30 below the minimum and could never be integrated away.
+    {"Stable", 60, 20, 100, 1, 3},
     {"Balanced", 30, 40, 100, 1, 3},
     {"Responsive", 10, 100, 100, 3, 5},
 };
@@ -2139,7 +2142,13 @@ void loop() {
       // teach it something false.
       if (!cfg.stopped && cfg.automatic && !purging() && !calibrating() &&
           !sensorSaturated())
-        adaptTick(now, pmFilt, hazeLevel());
+        // output, not hazeLevel(). doseCap applies riseRate to demand, and
+        // pulsing makes demand and on-wire differ by about 3x - so feeding the
+        // wire value estimated a constant in the wrong units and doseCap then
+        // under-dosed by that factor. Measured here: 55/s per wire, 17/s per
+        // demand, and 17 is what calibration's full-power pulse measured too,
+        // because during calibration pulsing is bypassed and the two are equal.
+        adaptTick(now, pmFilt, output);
       else
         adaptReset(now, pmFilt);
     }
