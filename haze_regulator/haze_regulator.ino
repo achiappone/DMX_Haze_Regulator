@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.01.000"
+#define FW_VERSION "1.01.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -886,7 +886,11 @@ input:disabled{cursor:not-allowed}
 <div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
 <label>Target band <span id=vsp></span></label>
-<div class=row><input type=number id=tgtmin min=0 max=1000 step=0.25 onchange="post('tgtmin',this.value)">
+<div class=row><input type=range id=tgtminr min=0 max=400 step=0.25
+ oninput="post('tgtmin',Math.min(+this.value,+tgtmax.value))">
+<input type=number id=tgtmin min=0 max=1000 step=0.25 onchange="post('tgtmin',this.value)"></div>
+<div class=row><input type=range id=tgtmaxr min=0 max=400 step=0.25
+ oninput="post('tgtmax',Math.max(+this.value,+tgtmin.value))">
 <input type=number id=tgtmax min=0 max=1000 step=0.25 onchange="post('tgtmax',this.value)"></div>
 <details><summary>Tuning</summary>
 <div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<5?0:1)">Calibrate</button>
@@ -1107,6 +1111,7 @@ async function tick(){
   if(document.activeElement!=tgtmax)tgtmax.value=s.tgtmax;
   if(!touching){manual.value=s.manual;
     gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
+    tgtminr.value=s.tgtmin;tgtmaxr.value=s.tgtmax;
     tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;risecut.value=s.risecut;
     ti.value=s.ti;dosepct.value=s.dosepct;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
     pperiod.value=s.pperiod;pminon.value=s.pminon;}
