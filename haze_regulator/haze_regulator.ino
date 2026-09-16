@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.10.000"
+#define FW_VERSION "1.10.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1777,12 +1777,27 @@ void handleSet() {
   if (server.hasArg("source")) {
     int sc = constrain(server.arg("source").toInt(), 0, 2);
     if (sc != cfg.source) {
+      // riseRate is in units of the control signal per second, so switching
+      // signals leaves it describing a scale that no longer exists and doseCap
+      // caps against nothing real - PM1.0 runs about half the 0.3um count, so
+      // the cap would be out by 2x until the estimator relearned it over the
+      // next half hour. Both readings come from the same sensor sample, so
+      // their ratio converts it exactly.
+      float before = ctrlValue();
       cfg.source = sc;
+      float after = ctrlValue();
+      if (before > 1.0f && after > 1.0f && cfg.riseRate > 0)
+        cfg.riseRate = constrain(cfg.riseRate * (after / before), 0.0f, 500.0f);
+      // A window spanning the switch would average two different units.
+      adaptT0 = 0;
       // The signals share tuning constants but not magnitudes, so a switch
       // starts from that source's own sensible target with nothing carried
       // over. PM1.0 runs about a third of PM2.5 on haze - measured 0.34 here -
       // so its default target is scaled to match rather than copied.
       cfg.setpoint = sc == 1 ? 20.0f : sc == 2 ? 50.0f : 150.0f;
+      logEvent("control signal -> %s, rise rescaled to %.1f/s",
+               sc == 1 ? "0.3um count/100" : sc == 2 ? "PM1.0" : "PM2.5",
+               (double)cfg.riseRate);
       integ = 0;
       pmFiltInit = false;
       pmCount = pmIdx = 0;
