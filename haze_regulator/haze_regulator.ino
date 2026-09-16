@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.13.000"
+#define FW_VERSION "1.14.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -110,6 +110,20 @@ unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // took a CSV export and arithmetic. The board knows both numbers - it should
 // say so.
 unsigned long capSince = 0, capLogged = 0;
+
+// Health the hardware watchdogs cannot see. All four on this chip - both timer
+// group watchdogs, the RTC one and the super watchdog - detect stoppage: a task
+// that never yields, an interrupt that never returns. Twice today the board did
+// neither. The loop ran, fed the task watchdog on every pass and answered pings
+// in 20ms, while serving the 20KB page at 14 and then 71 bytes a second. To a
+// watchdog that is a perfectly healthy board; to anyone trying to open the page
+// it is down. So measure the two things that actually went wrong.
+unsigned long loopTicks = 0, healthAt = 0;
+uint32_t loopRate = 0;       // loop passes per second
+uint32_t servedReqs = 0;     // requests handleClient actually did work for
+uint32_t slowestReqMs = 0;   // worst single response since boot
+unsigned long starvedSince = 0, reassocAt = 0;
+uint8_t slowReqs = 0;  // consecutive responses that crawled
 // Calibration measures the three numbers that are properties of the room, not
 // the equipment: how long haze takes to arrive, how fast it accumulates at full
 // output, and how slowly it clears. Guessing these is what causes overshoot.
@@ -1322,10 +1336,15 @@ function draw(){
   // with the excursion rather than switching on flat, so a near miss and a
   // runaway do not look the same. On the canvas element, not the canvas, so it
   // survives the clearRect at the top of every redraw.
+  // Always lit, in the same colour as the band, so the chart states where it
+  // stands rather than only shouting when something is wrong - a dark border
+  // and a border that has not noticed yet look identical. Holding is a soft
+  // green; out of band grows with the excursion so a near miss and a runaway
+  // do not look alike.
   c.style.boxShadow = zout>0
-    ? '0 0 '+Math.round(Math.min(30,9+zout/zw*24))+'px #c05050'+
-      (zout>zw*0.5?'dd':'99')
-    : 'none';
+    ? '0 0 '+Math.round(Math.min(30,10+zout/zw*22))+'px '+zcol+
+      (zout>zw*0.5?'dd':'aa')
+    : '0 0 10px '+zcol+'55';
   const spy=Ypm(sp);
   ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(ML,spy);ctx.lineTo(ML+pw,spy);ctx.stroke();
@@ -1561,7 +1580,8 @@ void handleState() {
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
-           "\"pminon\":%d,\"plevel\":%d,\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
+           "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
+           "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
            (int)WiFi.RSSI(), (unsigned long)(millis() / 1000), output, target,
@@ -1584,7 +1604,8 @@ void handleState() {
            pmSlope, predicted, cfg.stopped ? "true" : "false",
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
-           cfg.pulseMinOn, cfg.pulseLevel, cfg.autoPurge ? "true" : "false",
+           cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
+           cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
 }
@@ -2274,8 +2295,73 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
+  {
+    // handleClient returns immediately with no client, so only time the passes
+    // where it did something - otherwise the average is diluted to nothing by
+    // thousands of idle calls.
+    unsigned long t0 = millis();
+    server.handleClient();
+    unsigned long took = millis() - t0;
+    if (took > 1) {
+      servedReqs++;
+      if (took > slowestReqMs) slowestReqMs = took;
+      // A healthy board serves the whole page in about 265ms. Degraded, the
+      // same request took 30 seconds and returned a quarter of it. Anything
+      // past 8s is not slow, it is broken, and two in a row rules out one
+      // unlucky retransmit.
+      if (took > 8000) {
+        if (slowReqs < 255) slowReqs++;
+      } else {
+        slowReqs = 0;
+      }
+    }
+  }
+  loopTicks++;
   unsigned long now = millis();
+
+  if (now - healthAt >= 1000) {
+    loopRate = loopTicks * 1000 / (now - healthAt);
+    loopTicks = 0;
+    healthAt = now;
+
+    // A collapsed loop rate is this morning's fault: something blocking long
+    // enough that the web server is barely serviced. Deliberately a low bar -
+    // a healthy board runs thousands of passes a second, so anything under 100
+    // is already two orders of magnitude wrong - and it must persist, because
+    // a flash erase or a filesystem trim briefly does this on purpose.
+    if (loopRate < 100 && WiFi.status() == WL_CONNECTED) {
+      if (!starvedSince) starvedSince = now;
+      if (now - starvedSince > 120000) {
+        logEvent("WATCHDOG: %lu loop passes/s for 120s, restarting",
+                 (unsigned long)loopRate);
+        saveInteg();
+        delay(200);
+        ESP.restart();
+      }
+    } else {
+      starvedSince = 0;
+    }
+
+    // Tonight's fault is different and a reboot does not fix it: the radio, not
+    // the firmware. Reassociating can land on a better rate or a nearer AP, and
+    // costs a few seconds of web UI rather than the whole control loop, so it
+    // is tried long before anything more drastic.
+    // Measured tonight: at -81dBm the page served 71 bytes a second; a reboot
+    // reassociated at -70 and it served 102KB/s. The reboot was never the cure,
+    // the reassociation was - so do that directly, and trigger on responses
+    // actually crawling rather than on RSSI, which read -81 while a threshold
+    // of -85 would have sat there watching.
+    if (WiFi.status() == WL_CONNECTED &&
+        (slowReqs >= 2 || WiFi.RSSI() < -85) &&
+        (!reassocAt || now - reassocAt > 600000)) {
+      reassocAt = now;
+      logEvent("WATCHDOG: %u slow responses, rssi %d - reassociating",
+               (unsigned)slowReqs, (int)WiFi.RSSI());
+      slowReqs = 0;
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
 
   if (saveAt && (int32_t)(now - saveAt) >= 0) {
     saveAt = 0;
