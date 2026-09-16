@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.01.001"
+#define FW_VERSION "1.01.002"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1163,6 +1163,13 @@ void updateLed() {
   // worth seeing across the room whatever the output happens to be.
   bool sat = sensorOk && sensorSaturated();
   int16_t g = sat ? -1 : ledLevel(hazeLevel());
+  // Brightness follows the wire, which in pulse mode is off for most of the
+  // cycle - at 2% demand that is a ~2s burst every 120s, so the board looks
+  // dead to anyone glancing at it. Hold a dim floor while the regulator is
+  // running so the LED answers "is this alive" first and "how hard is it
+  // working" second. Dark now means stopped, which is the one state worth
+  // being unambiguous about.
+  if (!sat && !cfg.stopped && g < 12) g = 12;
   if (g == ledGreen) return;  // written only on change: this masks interrupts
   ledGreen = g;
   if (sat) rgbLedWrite(RGB_LED_PIN, 110, 0, 0);
