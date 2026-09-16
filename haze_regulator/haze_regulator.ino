@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.07.000"
+#define FW_VERSION "1.08.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -104,6 +104,12 @@ unsigned long purgeUntil = 0;
 unsigned long wifiTry = 0, wifiLostAt = 0;
 unsigned long satPurgeMs = SAT_PURGE_MIN_MS;  // escalates while it stays pegged
 unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
+// The dose cap clipping the controller is invisible from outside: output just
+// sits low while the room stays below the band, which reads as a machine that
+// cannot keep up. Working out that the PI wanted 95% and the cap allowed 5%
+// took a CSV export and arithmetic. The board knows both numbers - it should
+// say so.
+unsigned long capSince = 0, capLogged = 0;
 // Calibration measures the three numbers that are properties of the room, not
 // the equipment: how long haze takes to arrive, how fast it accumulates at full
 // output, and how slowly it clears. Guessing these is what causes overshoot.
@@ -124,6 +130,10 @@ bool calibrating() { return calState >= CAL_PURGE && calState <= CAL_DECAY; }
 struct Sample {
   uint16_t pm;    // PM2.5 mass, always, so the chart keeps one stable unit
   uint16_t ctrl;  // what the loop actually regulated on, in ctrlValue() units
+  uint16_t pm1;   // PM1.0 and PM10, for the chart. Deliberately not persisted:
+  uint16_t pm10;  // the regulated signal is worth surviving a reboot, two
+                  // diagnostic series are not worth a third format migration,
+                  // and restored samples simply read 0 for these.
   uint8_t out;
   uint8_t act;
 };
@@ -139,6 +149,7 @@ int fineN = 0, fineHead = 0, coarseN = 0, coarseHead = 0;
 int coarsePostBoot = 0;
 unsigned long histLast = 0, coarseLast = 0;
 uint32_t cAccPm = 0, cAccCtrl = 0, cAccOut = 0, cAccAct = 0;
+uint32_t cAccPm1 = 0, cAccPm10 = 0;
 int cAccN = 0;
 
 // Only built-in types in the signature: the Arduino preprocessor inserts
@@ -230,15 +241,16 @@ void trendAppend(uint16_t pm, uint16_t ctrl, uint8_t out, uint8_t act) {
   LittleFS.rename("/trend.tmp", TREND_PATH);
 }
 
-void histPush(bool coarse, uint16_t pm, uint16_t ctrl, uint8_t out, uint8_t act) {
+void histPush(bool coarse, uint16_t pm, uint16_t ctrl, uint16_t pm1,
+              uint16_t pm10, uint8_t out, uint8_t act) {
   if (coarse) {
     if (!coarseBuf) return;
-    coarseBuf[coarseHead] = {pm, ctrl, out, act};
+    coarseBuf[coarseHead] = {pm, ctrl, pm1, pm10, out, act};
     coarseHead = (coarseHead + 1) % coarseCap;
     if (coarseN < coarseCap) coarseN++;
   } else {
     if (!fineBuf) return;
-    fineBuf[fineHead] = {pm, ctrl, out, act};
+    fineBuf[fineHead] = {pm, ctrl, pm1, pm10, out, act};
     fineHead = (fineHead + 1) % fineCap;
     if (fineN < fineCap) fineN++;
   }
@@ -968,14 +980,21 @@ void selfTest() {
 }
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Haze Regulator</title><style>
+<title>Haze Regulator</title>
+<link rel=icon href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141414'/%3E%3Crect x='5' y='19' width='22' height='3' rx='1.5' fill='%234a9966' opacity='.55'/%3E%3Cpath d='M9 17c0-4 4-3 4-7 0-2-1-3-1-3 4 1 6 4 6 7 0 1 1 2 2 1 1 3-2 5-5 5-3 0-6-1-6-3z' fill='%2344aa99'/%3E%3C/svg%3E">
+<style>
 html{background:#0a0a0a}
 body{font:15px system-ui;margin:22px auto;max-width:1600px;padding:22px 28px;
 background:#141414;color:#eee;border:1px solid #2e2e2e;border-radius:14px;
 box-shadow:0 2px 18px #0008}
 .c{background:#1e1e1e}
 h1{font-size:17px;margin:0 0 12px}
+.brand{display:flex;align-items:baseline;gap:7px;margin:0 0 10px}
+.b1{font:700 19px/1 system-ui;letter-spacing:.14em;color:#eee}
+.b2{font:400 12px/1 system-ui;letter-spacing:.22em;color:#4a9;text-transform:uppercase}
 .ver{margin:18px 0 0;text-align:center;color:#666;font-size:12px}
+/* One definition of each series colour, shared by the cards and the chart. */
+.s25{color:#4a9}.s1{color:#79c0ff}.s10{color:#c792ea}
 .g{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px;margin-bottom:14px}
 .c{background:#1c1c1c;border-radius:8px;padding:10px}
 .c b{display:block;font-size:22px}.c span{color:#999;font-size:12px}
@@ -1022,11 +1041,12 @@ input:disabled{cursor:not-allowed}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
 </style>
+<div class=brand><span class=b1>CHAUVET</span><span class=b2>Professional</span></div>
 <h1>Haze Regulator</h1>
 <div class=g>
-<div class=c><span>PM2.5 ug/m3</span><b id=pm25>-</b></div>
-<div class=c><span>PM1.0</span><b id=pm10>-</b></div>
-<div class=c><span>PM10</span><b id=pm100>-</b></div>
+<div class=c><span>PM2.5 ug/m3</span><b id=pm25 class=s25>-</b></div>
+<div class=c><span>PM1.0</span><b id=pm10 class=s1>-</b></div>
+<div class=c><span>PM10</span><b id=pm100 class=s10>-</b></div>
 <div class=c><span>fine fraction</span><b id=fine>-</b></div>
 <div class=c><span>0.3um count</span><b id=c03>-</b></div>
 <div class=c><span>Haze output</span><b id=out>-</b></div>
@@ -1153,11 +1173,19 @@ function clampPan(){const m=Math.max(0,spanSec-winSec);
   if(offSec>m)offSec=m;
   pan.value=m?Math.round(offSec/m*1000):0;
   panlbl.textContent=offSec?('-'+ago(offSec)):'live';}
+// off is an age, measured from now - so a fixed off slides forward as now
+// advances, and a window parked over history quietly drifts off it. Values
+// already drawn appeared to change because they were being replaced by
+// different samples. Anchor the pan when it is set and grow off with elapsed
+// time, so a scrolled window stays over the same seconds.
+let panBase=0,panAt=0;
 function setPan(v){const m=Math.max(0,spanSec-winSec);
-  offSec=Math.round(m*v/1000);
+  panBase=Math.round(m*v/1000); panAt=Date.now(); offSec=panBase;
   panlbl.textContent=offSec?('-'+ago(offSec)):'live';
   loadHist();}
+function panNow(){return panBase?panBase+Math.round((Date.now()-panAt)/1000):0;}
 async function loadHist(){
+  offSec=panNow();
   try{HIST=await(await fetch('/api/history?win='+winSec+'&off='+offSec)).json();
     if(HIST.span!=null&&HIST.span!=spanSec){spanSec=HIST.span;clampPan();}
     draw();}catch(e){}
@@ -1226,13 +1254,26 @@ function draw(){
   ctx.setLineDash([5,3]);
   line(H.out,Ypc,'#ffb069',1.6);
   ctx.setLineDash([]);
+  // PM1.0 and PM10 are thinner and drawn first, so PM2.5 - the one the loop
+  // regulates on - stays the line your eye lands on. They are not persisted to
+  // flash, so restored samples read 0; a run of zeros is a gap in knowledge
+  // rather than clean air, and drawing it as a floor would be a lie.
+  const gapped=(a,col)=>{if(!a)return;ctx.strokeStyle=col;ctx.lineWidth=1.2;
+    ctx.beginPath();let pen=false;
+    for(let i=0;i<n;i++){if(!a[i]){pen=false;continue}
+      const y=Ypm(a[i]);pen?ctx.lineTo(X(i),y):ctx.moveTo(X(i),y);pen=true;}
+    ctx.stroke();};
+  gapped(H.pm1,'#79c0ff');
+  gapped(H.pm10,'#c792ea');
   line(H.pm,Ypm,'#4a9',2);
   ctx.font='11px system-ui';ctx.fillStyle='#777';
   const oldest=H.t[0]/10;
   ctx.fillText('showing '+(oldest>=3600?(oldest/3600).toFixed(1)+' h':
     oldest>=60?Math.round(oldest/60)+' min':Math.round(oldest)+' s')+
     ' of '+n+' points',ML,h-8);
-  ctx.textAlign='right';ctx.fillStyle='#4a9';ctx.fillText('ug/m3',ML-8,12);
+  ctx.textAlign='right';ctx.fillStyle='#4a9';ctx.fillText('PM2.5',ML-8,12);
+  ctx.fillStyle='#79c0ff';ctx.fillText('PM1.0',ML-8,24);
+  ctx.fillStyle='#c792ea';ctx.fillText('PM10',ML-8,36);
   ctx.textAlign='left';ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
 }
 addEventListener('resize',draw);
@@ -1510,7 +1551,9 @@ void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first)
         long vv = field == 1   ? buf[idx].pm
                   : field == 2 ? buf[idx].out
                   : field == 3 ? buf[idx].act
-                               : buf[idx].ctrl;
+                  : field == 4 ? buf[idx].ctrl
+                  : field == 5 ? buf[idx].pm1
+                               : buf[idx].pm10;
         if (vv > best) best = vv;
       }
       v = best;
@@ -1538,6 +1581,7 @@ void handleHistory() {
   if (server.hasArg("clear")) {
     fineN = fineHead = coarseN = coarseHead = coarsePostBoot = 0;
     cAccPm = cAccCtrl = cAccOut = cAccAct = 0;
+    cAccPm1 = cAccPm10 = 0;
     cAccN = 0;
     if (fsOk) LittleFS.remove(TREND_PATH);
     logEvent("trend history cleared");
@@ -1604,11 +1648,13 @@ void handleHistory() {
   server.sendContent(hd);
   // ctrl is appended last so existing keys keep their meaning and a page
   // served from an older cache still finds pm/out/act where it expects them.
-  for (int field = 0; field < 5; field++) {
+  for (int field = 0; field < 7; field++) {
     if (field) server.sendContent(field == 1   ? "],\"pm\":["
                                   : field == 2 ? "],\"out\":["
                                   : field == 3 ? "],\"act\":["
-                                               : "],\"ctrl\":[");
+                                  : field == 4 ? "],\"ctrl\":["
+                                  : field == 5 ? "],\"pm1\":["
+                                               : "],\"pm10\":[");
     bool first = true;
     if (nC) emitRange(true, coarseSkip, nC, stepC, field, first);
     if (nF) emitRange(false, fineFrom, nF, stepF, field, first);
@@ -1660,17 +1706,17 @@ void handleCsv() {
   server.sendHeader("Content-Disposition", "attachment; filename=haze_trend.csv");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  server.sendContent("seconds_ago,pm25_ugm3,ctrl,demand_pct,wire_pct\n");
+  server.sendContent("seconds_ago,pm25_ugm3,pm1_ugm3,pm10_ugm3,ctrl,demand_pct,wire_pct\n");
   int newest = (head - 1 + cap) % cap;
   String chunk;
   chunk.reserve(1400);
   for (int i = want - 1; i >= 0; i--) {
     int idx = ((newest - i) % cap + cap) % cap;
     long ms = (long)i * perMs;  // 2Hz samples need a decimal, or rows collide
-    char row[56];
-    snprintf(row, sizeof(row), "%ld.%01ld,%u,%u,%u,%u\n", ms / 1000,
-             (ms % 1000) / 100, buf[idx].pm, buf[idx].ctrl, buf[idx].out,
-             buf[idx].act);
+    char row[72];
+    snprintf(row, sizeof(row), "%ld.%01ld,%u,%u,%u,%u,%u,%u\n", ms / 1000,
+             (ms % 1000) / 100, buf[idx].pm, buf[idx].pm1, buf[idx].pm10,
+             buf[idx].ctrl, buf[idx].out, buf[idx].act);
     chunk += row;
     if (chunk.length() > 1200) {
       server.sendContent(chunk);
@@ -1863,7 +1909,7 @@ void setup() {
       uint8_t rec[TREND_REC];
       while (f.read(rec, TREND_REC) == TREND_REC)
         histPush(true, (uint16_t)(rec[0] | (rec[1] << 8)),
-                 (uint16_t)(rec[2] | (rec[3] << 8)), rec[4], rec[5]);
+                 (uint16_t)(rec[2] | (rec[3] << 8)), 0, 0, rec[4], rec[5]);
       f.close();
     }
     // Carry the v1 file across rather than dropping it: it has no control
@@ -1878,7 +1924,7 @@ void setup() {
         v1.seek(skip * 4);
         uint8_t r1[4];
         while (v1.read(r1, 4) == 4)
-          histPush(true, (uint16_t)(r1[0] | (r1[1] << 8)), 0, r1[2], r1[3]);
+          histPush(true, (uint16_t)(r1[0] | (r1[1] << 8)), 0, 0, 0, r1[2], r1[3]);
         v1.close();
         Serial.printf("imported %d minutes from the v1 trend file\n", coarseN);
       }
@@ -2057,6 +2103,10 @@ void setup() {
         } else if (up.status == UPLOAD_FILE_ABORTED) {
           Update.abort();
           logEvent("chunked upload aborted at %u", (unsigned)otaChunkOff);
+          // The run is dead, so the count belongs to nothing. Leaving it set
+          // made the next chunk look out of order against an offset no longer
+          // attached to an update, and the push retried that chunk forever.
+          otaChunkOff = 0;
         }
       });
   // Where the board thinks it is, so a push whose reply was lost can work out
@@ -2229,7 +2279,28 @@ void loop() {
           doseCap(deficitAtArrival(cfg.setpoint, pmFilt, pmSlope, cfg.deadTime) +
                       holdLoss(pmFilt, cfg.integralTi, cfg.deadTime),
                   cfg.riseRate, cfg.deadTime, cfg.dosePct);
-      if (target > cap) target = cap;
+      if (target > cap) {
+        // Only a clip big enough to matter, held long enough to not be a
+        // transient, and at most once every five minutes.
+        if (target - cap >= 15) {
+          if (!capSince) capSince = now;
+          if (now - capSince > 60000 && now - capLogged > 300000) {
+            capLogged = now;
+            logEvent("dose cap: controller wants %u%%, cap allows %u%% for %lus "
+                     "(gap %.0f, leak %.0f over %ds dead, rise %.1f/s)",
+                     target, cap, (unsigned long)((now - capSince) / 1000),
+                     (double)deficitAtArrival(cfg.setpoint, pmFilt, pmSlope,
+                                              cfg.deadTime),
+                     (double)holdLoss(pmFilt, cfg.integralTi, cfg.deadTime),
+                     cfg.deadTime, (double)cfg.riseRate);
+          }
+        } else {
+          capSince = 0;
+        }
+        target = cap;
+      } else {
+        capSince = 0;
+      }
 
       riseLock = riseLockNext(riseLock, pmSlope, cfg.riseCut);
       if (riseLock != wasLock)
@@ -2330,10 +2401,14 @@ void loop() {
     // Rounded, not truncated: at source=1 this is a count/100, so a unit here
     // is 100 particles and dropping the fraction biases the whole trend low.
     uint16_t ctrl = (uint16_t)lroundf(ctrlValue());
+    uint16_t pm1 = everRead ? data.pm10_env : 0;   // PM1.0
+    uint16_t pmT = everRead ? data.pm100_env : 0;  // PM10
     uint8_t act = hazeLevel();
-    histPush(false, pm, ctrl, output, act);
+    histPush(false, pm, ctrl, pm1, pmT, output, act);
     cAccPm += pm;
     cAccCtrl += ctrl;
+    cAccPm1 += pm1;
+    cAccPm10 += pmT;
     cAccOut += output;
     cAccAct += act;
     cAccN++;
@@ -2341,10 +2416,11 @@ void loop() {
       coarseLast = now;
       uint16_t cpm = cAccPm / cAccN, cctrl = cAccCtrl / cAccN;
       uint8_t co = cAccOut / cAccN, ca = cAccAct / cAccN;
-      histPush(true, cpm, cctrl, co, ca);
+      histPush(true, cpm, cctrl, cAccPm1 / cAccN, cAccPm10 / cAccN, co, ca);
       if (coarsePostBoot < coarseCap) coarsePostBoot++;
       trendAppend(cpm, cctrl, co, ca);
       cAccPm = cAccCtrl = cAccOut = cAccAct = 0;
+      cAccPm1 = cAccPm10 = 0;
       cAccN = 0;
     }
   }

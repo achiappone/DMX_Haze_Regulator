@@ -67,18 +67,29 @@ while [ "$OFF" -lt "$SIZE" ]; do
   sleep $((FAILS * 5))
   # The chunk may have landed with only the reply lost, so ask the board where
   # it actually is rather than assuming either way.
-  BOFF=$(curl -fs --netrc --max-time 20 "http://$HOST/update/chunk" 2>/dev/null | cut -d' ' -f1)
+  ST=$(curl -fs --netrc --max-time 20 "http://$HOST/update/chunk" 2>/dev/null)
+  BOFF=$(echo "$ST" | cut -d' ' -f1)
+  BRUN=$(echo "$ST" | cut -d' ' -f2)
+  # A chunk cut off partway leaves the board holding more bytes than we sent and
+  # the run aborted. Its offset is then neither "landed" nor "behind us", so the
+  # old logic retried the same chunk forever. The running flag is the honest
+  # signal: no run, no resume.
+  if [ "$BRUN" = "0" ]; then
+    if [ "$RESTARTED" -ge 3 ]; then
+      echo >&2; echo "FAILED: board dropped the run 3 times; link is too lossy" >&2; exit 1
+    fi
+    RESTARTED=$((RESTARTED + 1))
+    echo >&2; echo "  board aborted at $BOFF, restarting the image ($RESTARTED/3)" >&2
+    OFF=0
+    continue
+  fi
   case "$BOFF" in
     ''|*[!0-9]*) sleep 2 ;;
     *)
       if [ "$BOFF" -ge $((OFF + LEN)) ]; then OFF=$((OFF + LEN))
       elif [ "$BOFF" -lt "$OFF" ]; then
         # Restarting means another full erase, so only ever do it once.
-        if [ "$RESTARTED" = 1 ]; then
-          echo >&2; echo "FAILED: board dropped the run twice; link is too lossy" >&2
-          exit 1
-        fi
-        RESTARTED=1
+        RESTARTED=$((RESTARTED + 1))
         echo >&2; echo "  board dropped the run at $BOFF, restarting once" >&2
         OFF=0
       fi ;;
