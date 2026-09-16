@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.03.001"
+#define FW_VERSION "1.05.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -308,6 +308,30 @@ float slopeOf(int newest, int oldest, int samples) {
   return samples < 2 ? 0.0f : (float)(newest - oldest) / (samples - 1);
 }
 
+// Least squares across the whole window instead of a line through its two end
+// points. The end points are exactly where sensor noise does the most damage:
+// one plume drifting past as the window opens or closes swings the slope by
+// several units a second, and that slope is then multiplied by a lead of up to
+// 120s before it reaches the output. Measured on this rig the raw signal moved
+// 142 -> 319 in twelve seconds with the output at zero, which no room with a
+// 403s decay constant can actually do. Fitting every sample costs a few dozen
+// multiplies once a second and ignores what the ends happen to be doing.
+float slopeFit(const uint16_t *buf, int idx, int count, int cap) {
+  if (count < 5) return 0.0f;
+  float n = count;
+  float sx = (n - 1) * n / 2.0f;
+  float sxx = (n - 1) * n * (2 * n - 1) / 6.0f;
+  float sy = 0, sxy = 0;
+  for (int j = 0; j < count; j++) {
+    float y = buf[(idx - count + j + cap) % cap];
+    sy += y;
+    sxy += j * y;
+  }
+  float den = sxx - sx * sx / n;
+  if (den <= 0) return 0.0f;
+  return (sxy - sx * sy / n) / den;  // units per sample, and samples are 1Hz
+}
+
 // Falling and rising want different amounts of anticipation. Haze arrives in
 // seconds but clears over many minutes, so being late to stop costs far more
 // than being late to start.
@@ -335,6 +359,22 @@ float deficitAtArrival(float setpoint, float measured, float slopePerSec,
   // and never more, so that is the ceiling.
   return deficit > setpoint ? setpoint : deficit;
 }
+
+// How hard to chase, as one choice instead of five sliders. Deliberately does
+// not touch riseRate, deadTime, gain or the lead times: those describe the
+// machine and the room, they come from calibration, and a preset that
+// overwrote them would quietly discard a measurement in favour of a guess.
+// These five are all judgement - how much noise to swallow before reacting.
+struct Preset {
+  const char *name;
+  int tau, plevel, dosePct, slew, riseCut;
+};
+const Preset PRESETS[] = {
+    {"Stable", 60, 20, 60, 1, 3},
+    {"Balanced", 30, 40, 100, 1, 3},
+    {"Responsive", 10, 100, 100, 3, 5},
+};
+const size_t PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
 uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
   if (riseRate <= 0 || deadTime <= 0) return 100;  // uncalibrated: no opinion
@@ -740,6 +780,22 @@ void selfTest() {
   CHECK(slopeOf(100, 10, 31) == 3.0f);      // +90 over 30s
   CHECK(slopeOf(10, 100, 31) == -3.0f);     // falling
   CHECK(slopeOf(50, 50, 1) == 0.0f);        // too few samples
+  {
+    // A clean ramp fits exactly, and one wild sample barely moves the fit -
+    // the two-point version would have followed it straight off the rail.
+    uint16_t ramp[SLOPE_WIN];
+    for (int i = 0; i < SLOPE_WIN; i++) ramp[i] = 100 + 2 * i;
+    CHECK(fabsf(slopeFit(ramp, 0, SLOPE_WIN, SLOPE_WIN) - 2.0f) < 0.01f);
+    // A plume across the newest sample. The fit is not immune to it - it moves
+    // by about 4.8 - but the two-point slope moves by 25.6, and it is that
+    // number which gets multiplied by a 120s lead. Assert the ratio, since the
+    // ratio is the actual claim.
+    ramp[SLOPE_WIN - 1] = 900;
+    float fit = fabsf(slopeFit(ramp, 0, SLOPE_WIN, SLOPE_WIN) - 2.0f);
+    float two = fabsf(slopeOf(ramp[SLOPE_WIN - 1], ramp[0], SLOPE_WIN) - 2.0f);
+    CHECK(fit < two / 4.0f);
+    CHECK(slopeFit(ramp, 0, 4, SLOPE_WIN) == 0.0f);  // too few to fit
+  }
   CHECK(predict(100, -2.0f, 30) == 40);     // falling fast, act early
   CHECK(predict(10, -2.0f, 30) == 0);       // clamps at zero
   CHECK(predict(100, 0.0f, 30) == 100);     // flat trend changes nothing
@@ -862,6 +918,16 @@ summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
 #savebtn{margin-left:auto}
 #spnum,#tgtmin,#tgtmax{width:92px}
+#tgtminr,#tgtmaxr,#pan{flex:1;min-width:120px}
+.band{margin:0 0 14px}
+.bl{width:42px;color:#9a9;font-size:13px;flex:none}
+@media(max-width:640px){
+  body{margin:0;padding:12px 10px;border:0;border-radius:0;max-width:none}
+  canvas{height:250px}
+  .grp{width:100%;flex-wrap:wrap}
+  select,button{font-size:15px;padding:6px 8px}
+  #spnum,#tgtmin,#tgtmax{width:72px}
+}
 #setpoint{flex:1}
 #pkclr{padding:2px 8px;font-size:11px;margin-left:auto}
 .dim{opacity:.32}
@@ -893,13 +959,17 @@ input:disabled{cursor:not-allowed}
 <canvas id=chart></canvas>
 <div class=leg><i style=color:#4a9>PM2.5</i><i style=color:#ffb069>haze demand % (dashed)</i><i style=color:#e99444>actual on wire (shaded)</i>
 <i style=color:#888>setpoint</i><i id=peakLbl style=color:#4a9></i><i id=span></i></div>
+<div class=row><span class=bl>Scroll</span>
+<input type=range id=pan min=0 max=1000 value=0 oninput="setPan(this.value)">
+<button id=livebtn onclick="pan.value=0;setPan(0)">Live</button>
+<i id=panlbl style=color:#888;font-size:12px>live</i></div>
 <div class=leg><i id=peaks></i><button id=pkclr onclick="if(confirm('Clear recorded peaks?'))fetch('/api/history?clearpeaks=1')">Clear peaks</button></div>
 <div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
 <span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option></select></span>
 <span class=grp><select id=win onchange="setWin(this.value)">
-<option value=30>30 seconds</option><option value=60>1 minute</option><option value=300>5 minutes</option>
+<option value=30>30 seconds</option><option value=60>1 minute</option><option value=120>2 minutes</option><option value=300>5 minutes</option>
 <option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
 <option value=21600>6 hours</option><option value=43200>12 hours</option>
@@ -907,13 +977,17 @@ input:disabled{cursor:not-allowed}
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
+<div class="c band">
 <label>Target band <span id=vsp></span></label>
-<div class=row><input type=range id=tgtminr min=0 max=400 step=0.25
- oninput="post('tgtmin',Math.min(+this.value,+tgtmax.value))">
-<input type=number id=tgtmin min=0 max=1000 step=0.25 onchange="post('tgtmin',this.value)"></div>
-<div class=row><input type=range id=tgtmaxr min=0 max=400 step=0.25
- oninput="post('tgtmax',Math.max(+this.value,+tgtmin.value))">
-<input type=number id=tgtmax min=0 max=1000 step=0.25 onchange="post('tgtmax',this.value)"></div>
+<div class=row><span class=bl>Min</span>
+<input type=number id=tgtmin min=0 max=1000 step=0.25 onchange="post('tgtmin',this.value)">
+<input type=range id=tgtminr min=0 max=400 step=0.25
+ oninput="post('tgtmin',Math.min(+this.value,+tgtmax.value))"></div>
+<div class=row><span class=bl>Max</span>
+<input type=number id=tgtmax min=0 max=1000 step=0.25 onchange="post('tgtmax',this.value)">
+<input type=range id=tgtmaxr min=0 max=400 step=0.25
+ oninput="post('tgtmax',Math.max(+this.value,+tgtmin.value))"></div>
+</div>
 <details><summary>Tuning</summary>
 <div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<5?0:1)">Calibrate</button>
 <select id=calpulse onchange="post('calpulse',this.value)">
@@ -928,6 +1002,11 @@ input:disabled{cursor:not-allowed}
 <i id=pulsestat style=color:#888;font-size:12px></i></div>
 <div id=pprow><label>Pulse period, manual <span id=vpp></span>s</label><input type=range id=pperiod min=5 max=60 oninput="post('pperiod',this.value)"></div>
 <div id=pmrow><label>Min burst, auto <span id=vpm></span>s</label><input type=range id=pminon min=1 max=10 oninput="post('pminon',this.value)"></div>
+<div class=row><span class=bl>Preset</span>
+<button onclick="post('preset',0)">Stable</button>
+<button onclick="post('preset',1)">Balanced</button>
+<button onclick="post('preset',2)">Responsive</button>
+<i style=color:#888;font-size:12px>smoothing only - never touches calibration</i></div>
 <label>Burst level <span id=vpl></span>% <i style=color:#888;font-size:12px>lower = gentler, longer bursts for the same haze</i></label>
 <input type=range id=plevel min=10 max=100 oninput="post('plevel',this.value)">
 <label>Dose limit <span id=vdose></span>% of deficit <i style=color:#666>(needs calibration; caps overshoot)</i></label><input type=range id=dosepct min=10 max=200 step=5 oninput="post('dosepct',this.value)">
@@ -982,10 +1061,22 @@ function flush(){
 // History lives on the ESP32, so a reload is a new view of the same trend
 // rather than a fresh start, and the regulator keeps recording with no browser
 // open at all.
-let winSec=600,HIST=null;
-function setWin(v){winSec=+v;loadHist();}
+let winSec=600,offSec=0,spanSec=0,HIST=null;
+function setWin(v){winSec=+v;clampPan();loadHist();}
+// The slider spans whatever history exists, not a nominal week: most of a
+// 7 day track would be empty on a board that booted this morning.
+function clampPan(){const m=Math.max(0,spanSec-winSec);
+  if(offSec>m)offSec=m;
+  pan.value=m?Math.round(offSec/m*1000):0;
+  panlbl.textContent=offSec?('-'+ago(offSec)):'live';}
+function setPan(v){const m=Math.max(0,spanSec-winSec);
+  offSec=Math.round(m*v/1000);
+  panlbl.textContent=offSec?('-'+ago(offSec)):'live';
+  loadHist();}
 async function loadHist(){
-  try{HIST=await(await fetch('/api/history?win='+winSec)).json();draw();}catch(e){}
+  try{HIST=await(await fetch('/api/history?win='+winSec+'&off='+offSec)).json();
+    if(HIST.span!=null&&HIST.span!=spanSec){spanSec=HIST.span;clampPan();}
+    draw();}catch(e){}
 }
 function draw(){
   const c=chart,ctx=c.getContext('2d'),dpr=devicePixelRatio||1;
@@ -996,17 +1087,22 @@ function draw(){
   if(!H||!H.n||H.n<2){span.textContent='collecting...';return;}
   span.textContent='';
   const n=H.n,sp=H.sp,lo=H.lo??sp,hi=H.hi??sp;
-  const ML=56,MR=50,MT=30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
+  // A phone has no room for desktop gutters; the axis labels shrink with them.
+  const narrow=w<520;
+  const ML=narrow?36:56,MR=narrow?26:50,MT=narrow?22:30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
   const peak=Math.max(...H.pm);
   const top=Math.max(20,hi*1.25,peak)*1.08;
   // Position by real elapsed time, not by index. Spreading whatever points
   // exist across the full width made 30 minutes of data in a 24 hour window
   // look like a full day of history.
-  const X=i=>Math.max(ML,ML+pw-(H.t[i]/10)/winSec*pw);
+  // Ages are measured from now, so a scrolled-back window has to subtract
+  // its own offset or every point lands off the left edge.
+  const off=H.off??0;
+  const X=i=>Math.max(ML,ML+pw-((H.t[i]/10)-off)/winSec*pw);
   const Ypm=v=>MT+ph-v/top*ph;
   const Ypc=v=>MT+ph-v/100*ph;
   peakLbl.textContent='peak '+Math.round(peak);
-  ctx.font='12px system-ui';ctx.textBaseline='middle';
+  ctx.font=(narrow?'10px':'12px')+' system-ui';ctx.textBaseline='middle';
   for(let i=0;i<=4;i++){
     const y=MT+ph-i/4*ph;
     ctx.strokeStyle='#ffffff12';ctx.lineWidth=1;
@@ -1368,18 +1464,31 @@ void handleHistory() {
   win = constrain(win, 30, 604800);
   long winMs = (long)win * 1000;
 
-  long fineMs = (long)fineN * HIST_FINE_MS;
-  if (fineMs > winMs) fineMs = winMs;
-  int fineWant = fineMs / HIST_FINE_MS;
+  // Right edge of the window, as an age. 0 is live; anything else is the chart
+  // scrolled back into history, which is the only way to zoom in on something
+  // that has already happened - the buffers hold the detail, the old API just
+  // had no way to ask for it.
+  long offMs = (long)constrain(server.hasArg("off") ? server.arg("off").toInt() : 0,
+                               0, 604800) * 1000;
+  long farMs = offMs + winMs;  // left edge
+
+  // The fine tier only reaches back as far as it holds; beyond that the window
+  // is served entirely from minute samples.
+  long fineHave = (long)fineN * HIST_FINE_MS;
+  long fineFromMs = offMs;
+  long fineToMs = farMs < fineHave ? farMs : fineHave;
+  int fineFrom = fineFromMs / HIST_FINE_MS;
+  int fineWant = fineToMs > fineFromMs ? (fineToMs - fineFromMs) / HIST_FINE_MS : 0;
+  long fineMs = fineWant ? fineToMs - fineFromMs : 0;
 
   // Skip minute samples that the fine part already covers, then take only the
   // ones whose real age still falls inside the window.
-  int coarseSkip = fineMs / HIST_COARSE_MS;
+  int coarseSkip = fineToMs / HIST_COARSE_MS;
   if (coarseSkip > coarsePostBoot) coarseSkip = coarsePostBoot;
   int coarseWant = 0;
   for (int k = coarseSkip; k < coarseN; k++) {
-    if (coarseAgeMs(k) <= fineMs) { coarseSkip = k + 1; continue; }
-    if (coarseAgeMs(k) > winMs) break;
+    if (coarseAgeMs(k) <= fineToMs) { coarseSkip = k + 1; continue; }
+    if (coarseAgeMs(k) > farMs) break;
     coarseWant++;
   }
 
@@ -1402,10 +1511,12 @@ void handleHistory() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
-  char hd[120];
-  snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%.2f,\"lo\":%.2f,\"hi\":%.2f,\"t\":[",
+  char hd[176];
+  long spanMs = coarseN ? coarseAgeMs(coarseN - 1) : (long)fineN * HIST_FINE_MS;
+  snprintf(hd, sizeof(hd),
+           "{\"n\":%d,\"sp\":%.2f,\"lo\":%.2f,\"hi\":%.2f,\"span\":%ld,\"off\":%ld,\"t\":[",
            nF + nC, (double)cfg.setpoint, (double)targetMin(),
-           (double)targetMax());
+           (double)targetMax(), spanMs / 1000, offMs / 1000);
   server.sendContent(hd);
   // ctrl is appended last so existing keys keep their meaning and a page
   // served from an older cache still finds pm/out/act where it expects them.
@@ -1416,7 +1527,7 @@ void handleHistory() {
                                                : "],\"ctrl\":[");
     bool first = true;
     if (nC) emitRange(true, coarseSkip, nC, stepC, field, first);
-    if (nF) emitRange(false, 0, nF, stepF, field, first);
+    if (nF) emitRange(false, fineFrom, nF, stepF, field, first);
   }
   server.sendContent("]}");
   server.sendContent("");
@@ -1562,6 +1673,17 @@ void handleSet() {
   }
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
   if (server.hasArg("autopurge")) cfg.autoPurge = server.arg("autopurge").toInt();
+  if (server.hasArg("preset")) {
+    const Preset &pr = PRESETS[constrain(server.arg("preset").toInt(), 0,
+                                         (int)PRESET_COUNT - 1)];
+    cfg.filterTau = pr.tau;
+    cfg.pulseLevel = pr.plevel;
+    cfg.dosePct = pr.dosePct;
+    cfg.slew = pr.slew;
+    cfg.riseCut = pr.riseCut;
+    logEvent("preset %s: tau %d, burst %d%%, dose %d%%, slew %d, risecut %d",
+             pr.name, pr.tau, pr.plevel, pr.dosePct, pr.slew, pr.riseCut);
+  }
   if (server.hasArg("plevel"))
     cfg.pulseLevel = constrain(server.arg("plevel").toInt(), 10, 100);
   if (server.hasArg("pminon"))
@@ -1572,8 +1694,19 @@ void handleSet() {
     cfg.pulsePeriod = constrain(server.arg("pperiod").toInt(), 5, 60);
   if (server.hasArg("calibrate")) {
     if (server.arg("calibrate").toInt()) {
-      calState = CAL_PURGE; calT0 = millis(); calMsg[0] = 0;
-      logEvent("calibration started, %ds pulse", cfg.calPulse);
+      // Calibration drives the hazer, and the stopped branch in loop() resets
+      // calState every pass - so starting one while stopped logged "started"
+      // and then cancelled it within milliseconds, with nothing said. Refuse
+      // out loud instead. STOP is not overridden here on purpose: it is a
+      // latch that survives reboot, and a routine that can drive the machine
+      // through it is not a stop.
+      if (cfg.stopped) {
+        snprintf(calMsg, sizeof(calMsg), "release STOP first - calibration drives the hazer");
+        logEvent("calibration refused: STOP is engaged");
+      } else {
+        calState = CAL_PURGE; calT0 = millis(); calMsg[0] = 0;
+        logEvent("calibration started, %ds pulse", cfg.calPulse);
+      }
     } else {
       calState = CAL_OFF; calMsg[0] = 0; purgeUntil = 0;
     }
@@ -1925,10 +2058,7 @@ void loop() {
       pmHist[pmIdx] = (uint16_t)lroundf(pmFilt);
       pmIdx = (pmIdx + 1) % SLOPE_WIN;
       if (pmCount < SLOPE_WIN) pmCount++;
-      pmSlope = pmCount < 5 ? 0
-                            : slopeOf(pmHist[(pmIdx - 1 + SLOPE_WIN) % SLOPE_WIN],
-                                      pmHist[(pmIdx - pmCount + SLOPE_WIN) % SLOPE_WIN],
-                                      pmCount);
+      pmSlope = slopeFit(pmHist, pmIdx, pmCount, SLOPE_WIN);
       predicted = predict(pmFilt, pmSlope,
                           leadFor(pmSlope, cfg.leadFall, cfg.leadRise));
       predicted = controlPm(predicted, pmFilt, cfg.setpoint, cfg.deadband);
