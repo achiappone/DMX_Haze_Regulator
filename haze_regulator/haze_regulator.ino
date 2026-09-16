@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.01.002"
+#define FW_VERSION "1.02.002"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1687,6 +1687,14 @@ void setup() {
   // needing USB for every change stops being practical quickly. No auth: this
   // is a LAN appliance, and anyone who can reach the control page can already
   // drive the hazer. Do not expose it beyond the local network.
+  //
+  // An interrupted upload used to wedge the updater until the next reboot:
+  // Update.begin() was called on every UPLOAD_FILE_START and nothing ever
+  // aborted a run that stopped partway, so once one upload died every later
+  // begin() returned false and every flash answered FAILED. Six uploads cut off
+  // by a tunnel timeout left the board unflashable with no remote way out. Now
+  // a stale run is aborted before starting a new one, an aborted body aborts
+  // the run, and begin() failures are logged rather than discovered at the end.
   server.on(
       "/update", HTTP_POST,
       []() {
@@ -1706,14 +1714,111 @@ void setup() {
         if (!server.authenticate(WEB_USER, WEB_PASS)) return;
         HTTPUpload &up = server.upload();
         if (up.status == UPLOAD_FILE_START) {
+          if (Update.isRunning()) {
+            Update.abort();
+            logEvent("aborted a stale firmware upload before starting");
+          }
           logEvent("firmware upload started: %s", up.filename.c_str());
-          Update.begin(UPDATE_SIZE_UNKNOWN);
+          if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+            logEvent("update begin failed: %s", Update.errorString());
         } else if (up.status == UPLOAD_FILE_WRITE) {
           Update.write(up.buf, up.currentSize);
         } else if (up.status == UPLOAD_FILE_END) {
-          if (!Update.end(true)) logEvent("firmware update failed");
+          if (!Update.end(true))
+            logEvent("firmware update failed: %s", Update.errorString());
+        } else if (up.status == UPLOAD_FILE_ABORTED) {
+          Update.abort();
+          logEvent("firmware upload aborted after %u bytes", up.totalSize);
         }
       });
+  // Bytes handed to Update so far in this chunked run. Not Update.progress():
+  // that counts what has reached flash, and the library holds up to a 4096
+  // byte sector in its own buffer, so after a 131072 byte chunk it reports
+  // 126976 and every chunk after the first looks out of order.
+  static size_t otaChunkOff = 0;
+
+  // Chunked OTA, for flashing across the Cloudflare tunnel. The edge gives an
+  // origin 100 seconds to finish a request, and a 1.1MB image over wifi at
+  // -76dBm does not make it - six attempts in a row returned 502 with the
+  // upload still in flight. Each chunk is its own request and its own budget,
+  // so the link speed stops mattering. off must equal what has already been
+  // written: a chunk arriving out of order would corrupt the image silently,
+  // and that is the one failure this must never produce.
+  server.on(
+      "/update/chunk", HTTP_POST,
+      []() {
+        if (!authOk()) return;
+        server.sendHeader("Connection", "close");
+        if (Update.hasError()) {
+          String e = String("FAILED ") + Update.errorString();
+          Update.abort();
+          server.send(200, "text/plain", e);
+          return;
+        }
+        if (server.arg("last") != "1") {
+          server.send(200, "text/plain", String("OK ") + Update.progress());
+          return;
+        }
+        if (Update.end(true)) {
+          server.send(200, "text/plain", "OK - rebooting");
+          logEvent("firmware updated over wifi (chunked), rebooting");
+          delay(300);
+          ESP.restart();
+        } else {
+          logEvent("chunked update failed: %s", Update.errorString());
+          server.send(200, "text/plain", "FAILED");
+        }
+      },
+      []() {
+        if (!server.authenticate(WEB_USER, WEB_PASS)) return;
+        HTTPUpload &up = server.upload();
+        size_t off = (size_t)server.arg("off").toInt();
+        if (up.status == UPLOAD_FILE_START) {
+          if (off == 0) {
+            if (Update.isRunning()) Update.abort();
+            size_t total = (size_t)server.arg("total").toInt();
+            if (!Update.begin(total ? total : UPDATE_SIZE_UNKNOWN)) {
+              logEvent("chunked begin failed: %s", Update.errorString());
+            } else {
+              otaChunkOff = 0;
+              logEvent("chunked upload started, %u bytes", (unsigned)total);
+            }
+          } else if (!Update.isRunning() || otaChunkOff != off) {
+            logEvent("chunk at %u rejected, have %u", (unsigned)off,
+                     (unsigned)otaChunkOff);
+            Update.abort();
+          }
+        } else if (up.status == UPLOAD_FILE_WRITE) {
+          if (Update.isRunning()) {
+            size_t w = Update.write(up.buf, up.currentSize);
+            otaChunkOff += w;
+            // A short write means the image is already wrong; say so here
+            // rather than letting end() report a vague checksum failure.
+            if (w != up.currentSize)
+              logEvent("short write at %u: %u of %u", (unsigned)otaChunkOff,
+                       (unsigned)w, (unsigned)up.currentSize);
+          }
+        } else if (up.status == UPLOAD_FILE_ABORTED) {
+          Update.abort();
+          logEvent("chunked upload aborted at %u", (unsigned)otaChunkOff);
+        }
+      });
+  // Where the board thinks it is, so a push whose reply was lost can work out
+  // whether the chunk landed and resume instead of starting the megabyte again.
+  // A flaky link is the normal case here, not the exception.
+  server.on("/update/chunk", HTTP_GET, []() {
+    if (!authOk()) return;
+    server.send(200, "text/plain",
+                String(otaChunkOff) + " " + (Update.isRunning() ? "1" : "0"));
+  });
+  server.on("/api/reboot", []() {
+    if (!authOk()) return;
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", "rebooting");
+    logEvent("reboot requested over http");
+    delay(300);
+    ESP.restart();
+  });
   server.on("/api/set", handleSet);
   server.begin();
   prefs.putUInt("boot", bootId);

@@ -1,33 +1,110 @@
 #!/bin/sh
 # Build and push firmware over wifi. Usage: ./ota.sh [host]
-# Requires a build already carrying the /update endpoint - the first install of
-# that endpoint has to go over USB.
+# Works across the Cloudflare tunnel: the image goes up in chunks, each its own
+# request, and a chunk whose reply is lost is resumed rather than restarted.
+# Requires a build already carrying /update/chunk - the first install of that
+# endpoint has to go over USB or the LAN.
 set -e
 HOST="${1:-haze.local}"
 FQBN="esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi"
+SRC=haze_regulator/haze_regulator.ino
+# 128 KiB. Cloudflare gives an origin 100s per request and a whole 1.1MB image
+# over wifi at -76dBm does not fit; a chunk this size does, with room to spare.
+CHUNK=131072
+MAXFAIL=3
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
+
+VER=$(sed -n 's/^#define FW_VERSION "\(.*\)"/\1/p' "$SRC")
+[ -n "$VER" ] || { echo "cannot read FW_VERSION from $SRC" >&2; exit 1; }
+
 arduino-cli compile --warnings all -b "$FQBN" --output-dir "$OUT" haze_regulator
 BIN="$OUT/haze_regulator.ino.bin"
-echo "uploading $(wc -c < "$BIN") bytes to $HOST"
-curl -f --netrc --no-progress-meter --max-time 300 -F "firmware=@$BIN" "http://$HOST/update"
-echo
+SIZE=$(wc -c < "$BIN" | tr -d ' ')
+echo "uploading $SIZE bytes to $HOST as $VER"
 
-# A build that dies in setup() never reaches WiFi, so it cannot be reflashed
-# over the air - recovery means walking to the rig with a USB cable. Never let
-# a push end without proof the board came back.
-echo "waiting for $HOST to come back"
+# Connection: close on every chunk. ESP32's WebServer serves one client at a
+# time and cloudflared keeps origin connections alive between requests, so a
+# run of chunks otherwise leaves idle sockets the board is still nursing.
+post_chunk() {
+  curl -f --netrc --no-progress-meter --max-time 90 --http1.1 \
+    -H "Connection: close" -F "firmware=@$OUT/chunk" \
+    "http://$HOST/update/chunk?off=$1&total=$SIZE&last=$2" 2>/dev/null
+}
+
+OFF=0
+FAILS=0
+LASTLOST=0
+RESTARTED=0
+while [ "$OFF" -lt "$SIZE" ]; do
+  dd if="$BIN" of="$OUT/chunk" bs="$CHUNK" skip=$((OFF / CHUNK)) count=1 2>/dev/null
+  LEN=$(wc -c < "$OUT/chunk" | tr -d ' ')
+  if [ $((OFF + LEN)) -ge "$SIZE" ]; then LAST=1; else LAST=0; fi
+
+  if RESP=$(post_chunk "$OFF" "$LAST"); then
+    case "$RESP" in
+      FAILED*) echo "FAILED: board rejected the image at $OFF: $RESP" >&2; exit 1;;
+    esac
+    OFF=$((OFF + LEN))
+    FAILS=0
+    printf '\r  %s/%s bytes' "$OFF" "$SIZE"
+    continue
+  fi
+
+  # No usable reply. On the final chunk that proves nothing - the board
+  # finishes the image and reboots there, so the reply is expected to die.
+  if [ "$LAST" = 1 ]; then LASTLOST=1; break; fi
+
+  FAILS=$((FAILS + 1))
+  if [ "$FAILS" -gt "$MAXFAIL" ]; then
+    echo >&2; echo "FAILED: $MAXFAIL retries at offset $OFF, giving up" >&2; exit 1
+  fi
+  # Back off before touching it again. A chunk at offset 0 makes the board call
+  # Update.begin(), which erases the target partition and blocks the web server
+  # while it does - so an immediate retry lands on a board that cannot answer,
+  # fails, and erases again. Eight of those in a row took the board off the
+  # network entirely; the retry loop was causing the failures it was retrying.
+  sleep $((FAILS * 5))
+  # The chunk may have landed with only the reply lost, so ask the board where
+  # it actually is rather than assuming either way.
+  BOFF=$(curl -fs --netrc --max-time 20 "http://$HOST/update/chunk" 2>/dev/null | cut -d' ' -f1)
+  case "$BOFF" in
+    ''|*[!0-9]*) sleep 2 ;;
+    *)
+      if [ "$BOFF" -ge $((OFF + LEN)) ]; then OFF=$((OFF + LEN))
+      elif [ "$BOFF" -lt "$OFF" ]; then
+        # Restarting means another full erase, so only ever do it once.
+        if [ "$RESTARTED" = 1 ]; then
+          echo >&2; echo "FAILED: board dropped the run twice; link is too lossy" >&2
+          exit 1
+        fi
+        RESTARTED=1
+        echo >&2; echo "  board dropped the run at $BOFF, restarting once" >&2
+        OFF=0
+      fi ;;
+  esac
+done
+echo
+[ "$LASTLOST" = 1 ] && echo "last chunk reply lost, which is normal - the version check decides"
+
+# Confirm the board is running the build we just sent. Polling /api/state only
+# proves something answers, and a failed update leaves the OLD firmware
+# answering instantly - which is exactly how a failed flash once reported
+# success. The version string is the only honest check.
+echo "waiting for $HOST to come back as $VER"
 i=0
 while [ $i -lt 30 ]; do
   sleep 2
-  if curl -fs --netrc --max-time 3 "http://$HOST/api/state" > /dev/null 2>&1; then
-    echo "back up"
+  RUNNING=$(curl -fs --netrc --max-time 3 "http://$HOST/" 2>/dev/null \
+            | sed -n 's/.*class=ver>v\([0-9.]*\).*/\1/p') || true
+  if [ "$RUNNING" = "$VER" ]; then
+    echo "back up on $VER"
     curl -fs --netrc --max-time 5 "http://$HOST/api/events" 2>/dev/null \
       | grep -i selftest && echo "^^ self-test failures - fix before trusting this build" || true
     exit 0
   fi
   i=$((i + 1))
 done
-echo "FAILED: $HOST did not answer within 60s - it may be boot looping." >&2
-echo "Recover over USB: arduino-cli compile -b '$FQBN' -u -p /dev/cu.usbmodem* haze_regulator" >&2
+echo "FAILED: $HOST is running '${RUNNING:-nothing}', expected $VER." >&2
+echo "curl -X POST --netrc http://$HOST/api/reboot clears a wedged updater." >&2
 exit 1
