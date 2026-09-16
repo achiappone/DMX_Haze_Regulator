@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.10.001"
+#define FW_VERSION "1.11.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1786,7 +1786,8 @@ void handleSet() {
       float before = ctrlValue();
       cfg.source = sc;
       float after = ctrlValue();
-      if (before > 1.0f && after > 1.0f && cfg.riseRate > 0)
+      bool usable = before > 1.0f && after > 1.0f;
+      if (usable && cfg.riseRate > 0)
         cfg.riseRate = constrain(cfg.riseRate * (after / before), 0.0f, 500.0f);
       // A window spanning the switch would average two different units.
       adaptT0 = 0;
@@ -1794,10 +1795,22 @@ void handleSet() {
       // starts from that source's own sensible target with nothing carried
       // over. PM1.0 runs about a third of PM2.5 on haze - measured 0.34 here -
       // so its default target is scaled to match rather than copied.
-      cfg.setpoint = sc == 1 ? 20.0f : sc == 2 ? 50.0f : 150.0f;
-      logEvent("control signal -> %s, rise rescaled to %.1f/s",
+      // Convert the band rather than resetting it. The operator picked a haze
+      // level, not a number: the same air is 175 of 0.3um count/100, 205 of
+      // PM2.5 and 75 of PM1.0, and only the label changed. Falling back to a
+      // hardcoded default threw that choice away and made switching signals
+      // cost a retune. Both readings are the same sensor sample, so the ratio
+      // converts the band exactly the way it converts the rise rate.
+      if (usable) {
+        float k = after / before;
+        cfg.setpoint = constrain(cfg.setpoint * k, 0.0f, 1000.0f);
+        cfg.deadband = constrain(cfg.deadband * k, 0.0f, 100.0f);
+      } else {
+        cfg.setpoint = sc == 1 ? 20.0f : sc == 2 ? 50.0f : 150.0f;
+      }
+      logEvent("control signal -> %s, band %.0f-%.0f, rise %.1f/s",
                sc == 1 ? "0.3um count/100" : sc == 2 ? "PM1.0" : "PM2.5",
-               (double)cfg.riseRate);
+               (double)targetMin(), (double)targetMax(), (double)cfg.riseRate);
       integ = 0;
       pmFiltInit = false;
       pmCount = pmIdx = 0;
