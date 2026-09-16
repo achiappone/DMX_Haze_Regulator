@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.08.000"
+#define FW_VERSION "1.10.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -158,12 +158,14 @@ int cAccN = 0;
 // The minute tier is mirrored to flash so the trend survives a reboot, a
 // reflash, or the venue killing power. Appending 4 bytes a minute keeps the
 // write load trivial; the file is rotated only once it holds twice the ring.
-// v2: 6-byte records carrying the control signal alongside the mass reading.
-// A new path rather than a version byte - the old 4-byte file would parse as
-// garbage at 6 bytes a record, and silently wrong history is worse than none.
-#define TREND_PATH "/trend2.bin"
+// v3: 10-byte records, adding PM1.0 and PM10 so every charted series survives
+// a reboot. A new path per version rather than a version byte - a file written
+// at one record size parses as plausible garbage at another, and silently wrong
+// history is worse than none. Each version imports its predecessor once.
+#define TREND_PATH "/trend3.bin"
+#define TREND_PATH_V2 "/trend2.bin"
 #define TREND_PATH_V1 "/trend.bin"
-#define TREND_REC 6
+#define TREND_REC 10
 #define EVT_PATH "/events.log"
 #define EVT_MAX 196608  // 192KB, months of transitions
 bool fsOk = false;
@@ -215,12 +217,15 @@ void logEvent(const char *fmt, ...) {
 }
 
 
-void trendAppend(uint16_t pm, uint16_t ctrl, uint8_t out, uint8_t act) {
+void trendAppend(uint16_t pm, uint16_t ctrl, uint16_t pm1, uint16_t pm10,
+                 uint8_t out, uint8_t act) {
   if (!fsOk) return;
   File f = LittleFS.open(TREND_PATH, "a");
   if (!f) return;
-  uint8_t rec[TREND_REC] = {(uint8_t)(pm & 0xFF), (uint8_t)(pm >> 8),
+  uint8_t rec[TREND_REC] = {(uint8_t)(pm & 0xFF),   (uint8_t)(pm >> 8),
                             (uint8_t)(ctrl & 0xFF), (uint8_t)(ctrl >> 8),
+                            (uint8_t)(pm1 & 0xFF),  (uint8_t)(pm1 >> 8),
+                            (uint8_t)(pm10 & 0xFF), (uint8_t)(pm10 >> 8),
                             out, act};
   f.write(rec, TREND_REC);
   size_t sz = f.size();
@@ -241,6 +246,11 @@ void trendAppend(uint16_t pm, uint16_t ctrl, uint8_t out, uint8_t act) {
   LittleFS.rename("/trend.tmp", TREND_PATH);
 }
 
+// Read a trend file written by an older firmware. Layout is identical up to
+// the fields that version knew about, so the only difference is the record
+// size and which trailing columns exist.
+void importOld(const char *path, int rec);
+
 void histPush(bool coarse, uint16_t pm, uint16_t ctrl, uint16_t pm1,
               uint16_t pm10, uint8_t out, uint8_t act) {
   if (coarse) {
@@ -254,6 +264,25 @@ void histPush(bool coarse, uint16_t pm, uint16_t ctrl, uint16_t pm1,
     fineHead = (fineHead + 1) % fineCap;
     if (fineN < fineCap) fineN++;
   }
+}
+
+void importOld(const char *path, int rec) {
+  if (!LittleFS.exists(path)) return;
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  size_t recs = f.size() / rec;
+  size_t skip = recs > (size_t)coarseCap ? recs - coarseCap : 0;
+  f.seek(skip * rec);
+  uint8_t b[10];
+  while (f.read(b, rec) == rec) {
+    uint16_t pm = b[0] | (b[1] << 8);
+    uint16_t ctrl = rec >= 6 ? (uint16_t)(b[2] | (b[3] << 8)) : 0;
+    uint8_t out = rec >= 6 ? b[4] : b[2];
+    uint8_t act = rec >= 6 ? b[5] : b[3];
+    histPush(true, pm, ctrl, 0, 0, out, act);
+  }
+  f.close();
+  Serial.printf("imported %d minutes from %s\n", coarseN, path);
 }
 
 uint16_t pmHist[SLOPE_WIN];
@@ -482,7 +511,9 @@ bool riseLockNext(bool cur, float slope, int cut) {
 // output at zero, so the room could never reach target.
 bool sensorSaturated() {
   if (!everRead) return false;
-  return cfg.source ? data.particles_03um >= SAT_COUNT : data.pm25_env >= SAT_PM;
+  if (cfg.source == 1) return data.particles_03um >= SAT_COUNT;
+  if (cfg.source == 2) return data.pm10_env >= SAT_PM;
+  return data.pm25_env >= SAT_PM;
 }
 
 // The signal the loop regulates on. PM2.5 mass is reported in whole ug/m3, so
@@ -492,7 +523,9 @@ bool sensorSaturated() {
 // tuning constants, ranges and calibration numbers covers both sources.
 float ctrlValue() {
   if (!everRead) return 0.0f;
-  return cfg.source ? data.particles_03um / 100.0f : (float)data.pm25_env;
+  if (cfg.source == 1) return data.particles_03um / 100.0f;
+  if (cfg.source == 2) return (float)data.pm10_env;  // PM1.0
+  return (float)data.pm25_env;
 }
 
 // Prediction may hold output back while levels are still above the target band,
@@ -736,7 +769,7 @@ void loadCfg() {
       constrain(cfg.dmxAddress, 1, maxAddress(FIXTURES[cfg.fixture].chans));
   cfg.manual = constrain(cfg.manual, 0, 100);
   cfg.fan = constrain(cfg.fan, 0, 100);
-  cfg.source = constrain(cfg.source, 0, 1);
+  cfg.source = constrain(cfg.source, 0, 2);
   cfg.setpoint = constrain(cfg.setpoint, 0.0f, 1000.0f);
   cfg.deadband = constrain(cfg.deadband, 0.0f, 100.0f);
   cfg.gain = constrain(cfg.gain, 0.1f, 10.0f);
@@ -1134,7 +1167,8 @@ input:disabled{cursor:not-allowed}
 <input type=file name=firmware accept=.bin><button type=submit>Upload</button></form>
 <label>Control signal</label><select id=source onchange="post('source',this.value)">
 <option value=0>PM2.5 mass (ug/m3)</option>
-<option value=1>0.3um particle count (/100) - finer at low haze</option></select>
+<option value=1>0.3um particle count (/100) - finer at low haze</option>
+<option value=2>PM1.0 mass (ug/m3)</option></select>
 <label>Fixture</label><select id=fixture onchange="post('fixture',this.value)">
 <option value=0>Amhaze Stadium 2X IP (2ch: fan, haze)</option>
 <option value=1>Hurricane Haze 1DX (1ch: haze)</option></select>
@@ -1202,8 +1236,13 @@ function draw(){
   // A phone has no room for desktop gutters; the axis labels shrink with them.
   const narrow=w<520;
   const ML=narrow?36:56,MR=narrow?26:50,MT=narrow?22:30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
-  const peak=Math.max(...H.pm);
-  const top=Math.max(20,hi*1.25,peak)*1.08;
+  // Every mass series shares this axis, so the scale has to clear the tallest
+  // of them. PM10 runs about 1.21x PM2.5 here, so sizing on PM2.5 alone drew
+  // PM10 off the top of the plot exactly when it mattered. The peak readout
+  // stays PM2.5, which is the number the loop and the operator care about.
+  const hiOf=a=>a&&a.length?Math.max(...a):0;
+  const peak=hiOf(H.pm);
+  const top=Math.max(20,hi*1.25,peak,hiOf(H.pm1),hiOf(H.pm10))*1.08;
   // Position by real elapsed time, not by index. Spreading whatever points
   // exist across the full width made 30 minutes of data in a 24 hour window
   // look like a full day of history.
@@ -1295,7 +1334,7 @@ async function tick(){
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
   pmf.textContent=s.pmf; ctrl.textContent=ug(s.ctrl);
-  ctrllbl.textContent=s.source?'0.3um count /100':'PM2.5 ug/m3';
+  ctrllbl.textContent=s.source==1?'0.3um count /100':s.source==2?'PM1.0 ug/m3':'PM2.5 ug/m3';
   if(document.activeElement!=source)source.value=s.source;
   // Hand the device a wall clock so the event log can carry real times.
   if(!s.clock)post('epoch',Math.floor(Date.now()/1000)-new Date().getTimezoneOffset()*60);
@@ -1316,7 +1355,7 @@ async function tick(){
     !s.sensorOk?'SENSOR LOST - output ramping to zero':
     s.riselock?'RISING FAST - output held off until it levels out':
     s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
-    ((s.source?s.c03>=60000:s.pm25>=990)?(s.purge?'SENSOR SATURATED - purging to clear':
+    ((s.source==1?s.c03>=60000:s.source==2?s.pm10>=990:s.pm25>=990)?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
   vman.textContent=s.manual;
   vsp.textContent=ug(s.tgtmin)+' to '+ug(s.tgtmax);
@@ -1736,12 +1775,14 @@ void handleSet() {
   }
   if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
   if (server.hasArg("source")) {
-    int sc = constrain(server.arg("source").toInt(), 0, 1);
+    int sc = constrain(server.arg("source").toInt(), 0, 2);
     if (sc != cfg.source) {
       cfg.source = sc;
-      // The two signals share tuning constants but not magnitudes, so a switch
-      // starts from that source's own sensible target with nothing carried over.
-      cfg.setpoint = sc ? 20.0f : 150.0f;
+      // The signals share tuning constants but not magnitudes, so a switch
+      // starts from that source's own sensible target with nothing carried
+      // over. PM1.0 runs about a third of PM2.5 on haze - measured 0.34 here -
+      // so its default target is scaled to match rather than copied.
+      cfg.setpoint = sc == 1 ? 20.0f : sc == 2 ? 50.0f : 150.0f;
       integ = 0;
       pmFiltInit = false;
       pmCount = pmIdx = 0;
@@ -1909,27 +1950,18 @@ void setup() {
       uint8_t rec[TREND_REC];
       while (f.read(rec, TREND_REC) == TREND_REC)
         histPush(true, (uint16_t)(rec[0] | (rec[1] << 8)),
-                 (uint16_t)(rec[2] | (rec[3] << 8)), 0, 0, rec[4], rec[5]);
+                 (uint16_t)(rec[2] | (rec[3] << 8)),
+                 (uint16_t)(rec[4] | (rec[5] << 8)),
+                 (uint16_t)(rec[6] | (rec[7] << 8)), rec[8], rec[9]);
       f.close();
     }
-    // Carry the v1 file across rather than dropping it: it has no control
-    // signal, but its mass readings are real history and throwing away days of
-    // trend to add a column is a bad trade. Pre-upgrade samples read ctrl 0,
-    // which is why the chart must not draw ctrl where it was never recorded.
-    if (!coarseN && LittleFS.exists(TREND_PATH_V1)) {
-      File v1 = LittleFS.open(TREND_PATH_V1, "r");
-      if (v1) {
-        size_t recs = v1.size() / 4;
-        size_t skip = recs > (size_t)coarseCap ? recs - coarseCap : 0;
-        v1.seek(skip * 4);
-        uint8_t r1[4];
-        while (v1.read(r1, 4) == 4)
-          histPush(true, (uint16_t)(r1[0] | (r1[1] << 8)), 0, 0, 0, r1[2], r1[3]);
-        v1.close();
-        Serial.printf("imported %d minutes from the v1 trend file\n", coarseN);
-      }
-      LittleFS.remove(TREND_PATH_V1);
-    }
+    // Carry older files across rather than dropping them. Their missing
+    // columns read 0, which the chart draws as a gap rather than a value -
+    // throwing away days of trend to add a column is a bad trade.
+    if (!coarseN) importOld(TREND_PATH_V2, 6);
+    if (!coarseN) importOld(TREND_PATH_V1, 4);
+    LittleFS.remove(TREND_PATH_V2);
+    LittleFS.remove(TREND_PATH_V1);
     Serial.printf("trend restored from flash: %d minutes\n", coarseN);
   } else {
     Serial.println("LittleFS mount failed - trend will not survive a reboot");
@@ -2418,7 +2450,7 @@ void loop() {
       uint8_t co = cAccOut / cAccN, ca = cAccAct / cAccN;
       histPush(true, cpm, cctrl, cAccPm1 / cAccN, cAccPm10 / cAccN, co, ca);
       if (coarsePostBoot < coarseCap) coarsePostBoot++;
-      trendAppend(cpm, cctrl, co, ca);
+      trendAppend(cpm, cctrl, cAccPm1 / cAccN, cAccPm10 / cAccN, co, ca);
       cAccPm = cAccCtrl = cAccOut = cAccAct = 0;
       cAccPm1 = cAccPm10 = 0;
       cAccN = 0;
