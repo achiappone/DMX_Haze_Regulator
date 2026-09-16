@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.11.004"
+#define FW_VERSION "1.12.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1013,7 +1013,7 @@ void selfTest() {
 }
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Haze Regulator - Chauvet Professional</title>
+<title>Chauvet Pro-Haze-B-Steady</title>
 <!-- A C lettermark, not the Chauvet logo: the artwork is not in this repo and
      drawing a trademark from memory gets it subtly wrong in a way that looks
      worse than plain type. Drop the real SVG in and swap the href. -->
@@ -1077,7 +1077,7 @@ input:disabled{cursor:not-allowed}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
 </style>
-<div class=brand><span class=b1>CHAUVET</span><span class=b2>Professional</span></div>
+<div class=brand><span class=b1>CHAUVET</span><span class=b2>Pro-Haze-B-Steady</span></div>
 <h1>Haze Regulator</h1>
 <div class=g>
 <div class=c><span>PM2.5 ug/m3</span><b id=pm25 class=s25>-</b></div>
@@ -1278,8 +1278,19 @@ function draw(){
   // because the useful question is "is the trace inside it", not "where are
   // the edges" - and a filled band answers that at a glance while scrolling.
   if(hi>lo){const yh=Ypm(hi),yl=Ypm(lo);
-    ctx.fillStyle='#4a996618';ctx.fillRect(ML,yh,pw,yl-yh);
-    ctx.strokeStyle='#4a996655';ctx.lineWidth=1;
+    // Judged on the regulated signal, not on PM2.5: the band is expressed in
+    // whatever the loop controls, and colouring it by a series it does not
+    // govern would call the loop wrong when it is holding its target exactly.
+    // Yellow is a warning while still inside - by the time a 64s dead time
+    // shows a breach the dose that caused it landed a minute ago.
+    const cur=(H.ctrl&&H.ctrl.length?H.ctrl:H.pm)[n-1];
+    const w=hi-lo, out=Math.max(lo-cur,cur-hi,0), edge=Math.min(cur-lo,hi-cur);
+    const col = out>w*0.5 ? '#c05050'      // well out
+              : out>0     ? '#d08a3a'      // out
+              : edge<w*0.15 ? '#c9b458'    // inside, but drifting at an edge
+                            : '#4a9966';   // holding
+    ctx.fillStyle=col+'1e';ctx.fillRect(ML,yh,pw,yl-yh);
+    ctx.strokeStyle=col+'77';ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(ML,yh);ctx.lineTo(ML+pw,yh);
     ctx.moveTo(ML,yl);ctx.lineTo(ML+pw,yl);ctx.stroke();}
   const spy=Ypm(sp);
