@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.00.001"
+#define FW_VERSION "1.01.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -652,6 +652,24 @@ uint8_t computePI(float setpoint, float pm25, float deadband, float gain, int ti
 }
 
 // Proportional-only wrapper, used by the tests.
+// computePI zeroes the error anywhere inside +/-deadband, so setpoint and
+// deadband have always described a band - a centre and a half-width. Saying it
+// as min/max changes no behaviour, only which two numbers the operator types.
+// Kept as derived accessors rather than stored fields so there is exactly one
+// representation of the band and the two can never disagree.
+float targetMin() { return cfg.setpoint - cfg.deadband; }
+float targetMax() { return cfg.setpoint + cfg.deadband; }
+
+void setTargetBand(float lo, float hi) {
+  if (hi < lo) { float t = lo; lo = hi; hi = t; }  // typed backwards: do not invert the loop
+  float was = cfg.setpoint;
+  cfg.setpoint = constrain((lo + hi) * 0.5f, 0.0f, 1000.0f);
+  cfg.deadband = constrain((hi - lo) * 0.5f, 0.0f, 100.0f);
+  // Same rule the old setpoint setter used: an integral charged to hold a
+  // different level keeps commanding it for minutes after the band moves.
+  if (fabsf(cfg.setpoint - was) > fmaxf(2.0f, was * 0.1f)) integ = 0;
+}
+
 uint8_t computeOutput(float setpoint, float pm25, float deadband, float gain) {
   float ignore = 0;
   return computePI(setpoint, pm25, deadband, gain, 0, ignore);
@@ -679,6 +697,13 @@ int checkFails = 0;
       Serial.printf("SELFTEST FAILED line %d: %s\n", __LINE__, #c); \
     }                                                               \
   } while (0)
+
+// Defined further down, and the only thing selfTest calls that is. The .ino
+// auto-prototype pass normally covers this, but it is sensitive to edits
+// elsewhere in the file - it stopped emitting this one after an unrelated
+// change to the page markup. Declaring it explicitly costs a line and does not
+// depend on that pass behaving.
+uint8_t ledLevel(uint8_t pct);
 
 void selfTest() {
   CHECK(computeOutput(150, 200, 10, 1.0f) == 0);   // too hazy -> off
@@ -728,6 +753,28 @@ void selfTest() {
   CHECK(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
   // Falling 0.62/s for 90s adds ~56 to a 135 deficit
   // 190.8 projected, but capped at the setpoint by the clause above
+  // setTargetBand writes live config, so put it back afterwards. Today this
+  // runs before prefs load and the values would be overwritten anyway, but a
+  // self-test that quietly rewrites the operator's band if anyone reorders
+  // setup() is not a trade worth leaving in place.
+  const float keepSp = cfg.setpoint, keepDb = cfg.deadband;
+  // The band round-trips: what you type is what comes back.
+  setTargetBand(160, 190);
+  CHECK(fabsf(cfg.setpoint - 175.0f) < 0.01f);
+  CHECK(fabsf(cfg.deadband - 15.0f) < 0.01f);
+  CHECK(fabsf(targetMin() - 160.0f) < 0.01f);
+  CHECK(fabsf(targetMax() - 190.0f) < 0.01f);
+  setTargetBand(190, 160);  // reversed input must not invert the band
+  CHECK(fabsf(targetMin() - 160.0f) < 0.01f);
+  // Inside the band the loop does nothing; below min it acts; above max it is
+  // off. This is the behaviour min/max is only renaming.
+  CHECK(computeOutput(175, 175, 15, 1.0f) == 0);   // centre
+  CHECK(computeOutput(175, 161, 15, 1.0f) == 0);   // just inside min
+  CHECK(computeOutput(175, 189, 15, 1.0f) == 0);   // just inside max
+  CHECK(computeOutput(175, 200, 15, 1.0f) == 0);   // above max
+  CHECK(computeOutput(175, 150, 15, 1.0f) == 10);  // below min: err 25 less 15
+  cfg.setpoint = keepSp;
+  cfg.deadband = keepDb;
   CHECK(deficitAtArrival(150, 15, -0.62f, 90) == 150.0f);
   CHECK(fabsf(deficitAtArrival(150, 120, -0.2f, 90) - 48.0f) < 0.5f);
   CHECK(deficitAtArrival(150, 150, 0.0f, 90) == 0.0f);
@@ -792,7 +839,7 @@ details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
 #savebtn{margin-left:auto}
-#spnum{width:92px}
+#spnum,#tgtmin,#tgtmax{width:92px}
 #setpoint{flex:1}
 #pkclr{padding:2px 8px;font-size:11px;margin-left:auto}
 .dim{opacity:.32}
@@ -838,9 +885,9 @@ input:disabled{cursor:not-allowed}
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
-<label>Target haze <span id=vsp></span> ug/m3</label>
-<div class=row><input type=range id=setpoint min=0 max=400 step=0.25 oninput="post('setpoint',this.value)">
-<input type=number id=spnum min=0 max=400 step=0.25 onchange="post('setpoint',this.value)"></div>
+<label>Target band <span id=vsp></span></label>
+<div class=row><input type=number id=tgtmin min=0 max=1000 step=0.25 onchange="post('tgtmin',this.value)">
+<input type=number id=tgtmax min=0 max=1000 step=0.25 onchange="post('tgtmax',this.value)"></div>
 <details><summary>Tuning</summary>
 <div class=row><button id=cal onclick="post('calibrate',s_cal&&s_cal<5?0:1)">Calibrate</button>
 <select id=calpulse onchange="post('calpulse',this.value)">
@@ -848,7 +895,6 @@ input:disabled{cursor:not-allowed}
 <option value=120>2 min</option><option value=300>5 min</option>
 <option value=600>10 min</option></select>
 <i id=calstat style=color:#888;font-size:12px></i></div>
-<label>Deadband <span id=vdb></span></label><input type=range id=deadband min=0 max=100 oninput="post('deadband',this.value)">
 <label>Gain <span id=vg></span></label><input type=range id=gain min=1 max=100 oninput="post('gain',this.value/10)">
 <label>Slew limit <span id=vsl></span>%/sec</label><input type=range id=slew min=1 max=100 oninput="post('slew',this.value)">
 <div class=row><button id=apbtn onclick="post('autopurge',apOn?0:1)">Auto-purge on saturation</button></div>
@@ -921,10 +967,10 @@ function draw(){
   const H=HIST;
   if(!H||!H.n||H.n<2){span.textContent='collecting...';return;}
   span.textContent='';
-  const n=H.n,sp=H.sp;
+  const n=H.n,sp=H.sp,lo=H.lo??sp,hi=H.hi??sp;
   const ML=56,MR=50,MT=30,MB=22,pw=w-ML-MR,ph=h-MT-MB;
   const peak=Math.max(...H.pm);
-  const top=Math.max(20,sp*1.25,peak)*1.08;
+  const top=Math.max(20,hi*1.25,peak)*1.08;
   // Position by real elapsed time, not by index. Spreading whatever points
   // exist across the full width made 30 minutes of data in a 24 hour window
   // look like a full day of history.
@@ -943,6 +989,14 @@ function draw(){
     ctx.fillText(i*25+'%',ML+pw+8,y);
   }
   ctx.textAlign='left';
+  // The band the loop actually holds. Drawn as a region rather than two lines
+  // because the useful question is "is the trace inside it", not "where are
+  // the edges" - and a filled band answers that at a glance while scrolling.
+  if(hi>lo){const yh=Ypm(hi),yl=Ypm(lo);
+    ctx.fillStyle='#4a996618';ctx.fillRect(ML,yh,pw,yl-yh);
+    ctx.strokeStyle='#4a996655';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(ML,yh);ctx.lineTo(ML+pw,yh);
+    ctx.moveTo(ML,yl);ctx.lineTo(ML+pw,yl);ctx.stroke();}
   const spy=Ypm(sp);
   ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(ML,spy);ctx.lineTo(ML+pw,spy);ctx.stroke();
@@ -1015,8 +1069,8 @@ async function tick(){
     s.noresp?'NO RESPONSE - commanding haze but levels are not rising (fluid, heater, or DMX?)':
     ((s.source?s.c03>=60000:s.pm25>=990)?(s.purge?'SENSOR SATURATED - purging to clear':
        'sensor near saturation - readings unreliable'):'');
-  vman.textContent=s.manual; vsp.textContent=ug(s.setpoint);
-  vdb.textContent=ug(s.deadband);
+  vman.textContent=s.manual;
+  vsp.textContent=ug(s.tgtmin)+' to '+ug(s.tgtmax);
   vg.textContent=s.gain.toFixed(1); vsl.textContent=s.slew;
   vfan.textContent=s.fan; fanrow.hidden=!s.hasfan;
   vtau.textContent=s.tau; vtail.textContent=s.tail; vfloor.textContent=s.floor;
@@ -1049,10 +1103,10 @@ async function tick(){
   purge.className=purging?'on':'';
   dmxaddr.max=s.maxaddr;
   if(document.activeElement!=fixture)fixture.value=s.fixture;
-  if(document.activeElement!=spnum)spnum.value=s.setpoint;
+  if(document.activeElement!=tgtmin)tgtmin.value=s.tgtmin;
+  if(document.activeElement!=tgtmax)tgtmax.value=s.tgtmax;
   if(!touching){manual.value=s.manual;
-    deadband.value=s.deadband;gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
-    setpoint.value=s.setpoint;
+    gain.value=s.gain*10;slew.value=s.slew;fan.value=s.fan;
     tau.value=s.tau;tail.value=s.tail;floor.value=s.floor;risecut.value=s.risecut;
     ti.value=s.ti;dosepct.value=s.dosepct;leadfall.value=s.leadfall;leadrise.value=s.leadrise;
     pperiod.value=s.pperiod;pminon.value=s.pminon;}
@@ -1137,7 +1191,8 @@ void handleState() {
   snprintf(buf, sizeof(buf),
            "{\"pm25\":%u,\"pm10\":%u,\"pm100\":%u,\"c03\":%u,\"rssi\":%d,\"up\":%lu,"
            "\"output\":%u,\"target\":%u,\"automatic\":%s,\"manual\":%u,"
-           "\"source\":%d,\"ctrl\":%.2f,\"setpoint\":%.2f,\"deadband\":%.2f,\"gain\":%.1f,\"slew\":%d,"
+           "\"source\":%d,\"ctrl\":%.2f,\"setpoint\":%.2f,\"deadband\":%.2f,"
+           "\"tgtmin\":%.2f,\"tgtmax\":%.2f,\"gain\":%.1f,\"slew\":%d,"
            "\"fan\":%d,\"dmxaddr\":%d,\"dmxhaze\":%u,\"fixture\":%d,"
            "\"hasfan\":%s,\"maxaddr\":%d,\"purge\":%d,\"dmxfan\":%u,\"leadfall\":%d,\"leadrise\":%d,\"tau\":%d,\"tail\":%d,\"floor\":%d,\"risecut\":%d,\"riselock\":%s,\"ti\":%d,\"integ\":%.1f,\"rise\":%.2f,\"dead\":%d,\"dosepct\":%d,\"clock\":%s,\"pmf\":%d,\"pkses\":%u,\"pksesat\":%lu,"
            "\"pkall\":%u,\"pkallb\":%lu,\"pkallat\":%lu,\"pkout\":%u,"
@@ -1149,6 +1204,7 @@ void handleState() {
            (int)WiFi.RSSI(), (unsigned long)(millis() / 1000), output, target,
            cfg.automatic ? "true" : "false", cfg.manual, cfg.source,
            (double)ctrlValue(), (double)cfg.setpoint, (double)cfg.deadband,
+           (double)targetMin(), (double)targetMax(),
            cfg.gain, cfg.slew, cfg.fan, cfg.dmxAddress,
            toDmx(hazeLevel()), cfg.fixture,
            FIXTURES[cfg.fixture].fanOff >= 0 ? "true" : "false",
@@ -1211,14 +1267,35 @@ void emitRange(bool coarse, int from, int cnt, int step, int field, bool &first)
   String chunk;
   chunk.reserve(1200);
   for (int k = from + (cnt - 1) * step; k >= from; k -= step) {
-    int idx = ((newest - k) % cap + cap) % cap;
     long v;
-    if (field == 0)
+    if (field == 0) {
+      // The timestamp still comes from the bucket's own edge, so x positions
+      // are unchanged and the axis does not shift.
       v = (coarse ? coarseAgeMs(k) : (long)k * per) / 100;  // tenths of a second
-    else if (field == 1) v = buf[idx].pm;
-    else if (field == 2) v = buf[idx].out;
-    else if (field == 3) v = buf[idx].act;
-    else v = buf[idx].ctrl;
+    } else {
+      // Worst value in the bucket, not whichever single sample the stride
+      // happens to land on. In pulse mode the wire is a square wave - a ~6s
+      // burst every ~29s at 21% demand - while an hour-wide window strides
+      // ~8.5s, so plain subsampling hit a burst or missed it depending on
+      // where the stride fell. Scrolling by one sample changed the answer and
+      // bursts blinked in and out. Taking the max makes a spike that exists
+      // stay drawn, at the cost of reading high for a pulsed signal on wide
+      // windows: one pixel covers several bursts and shows the burst level
+      // rather than the duty. For a chart whose job is finding excursions,
+      // never hiding one is the right side to err on.
+      long best = 0;
+      for (int j = 0; j < step; j++) {
+        int kk = k - j;  // toward newer; the bucket is (k-step, k]
+        if (kk < from) break;
+        int idx = ((newest - kk) % cap + cap) % cap;
+        long vv = field == 1   ? buf[idx].pm
+                  : field == 2 ? buf[idx].out
+                  : field == 3 ? buf[idx].act
+                               : buf[idx].ctrl;
+        if (vv > best) best = vv;
+      }
+      v = best;
+    }
     if (!first) chunk += ',';
     first = false;
     chunk += v;
@@ -1286,9 +1363,10 @@ void handleHistory() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
-  char hd[80];
-  snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%.2f,\"t\":[", nF + nC,
-           (double)cfg.setpoint);
+  char hd[120];
+  snprintf(hd, sizeof(hd), "{\"n\":%d,\"sp\":%.2f,\"lo\":%.2f,\"hi\":%.2f,\"t\":[",
+           nF + nC, (double)cfg.setpoint, (double)targetMin(),
+           (double)targetMax());
   server.sendContent(hd);
   // ctrl is appended last so existing keys keep their meaning and a page
   // served from an older cache still finds pm/out/act where it expects them.
@@ -1400,6 +1478,13 @@ void handleSet() {
   }
   if (server.hasArg("deadband"))
     cfg.deadband = constrain(server.arg("deadband").toFloat(), 0.0f, 100.0f);
+  // After the raw pair, so a client sending both wins with the band. The page
+  // coalesces edits into one request, so min and max can arrive together.
+  if (server.hasArg("tgtmin") || server.hasArg("tgtmax")) {
+    float lo = server.hasArg("tgtmin") ? server.arg("tgtmin").toFloat() : targetMin();
+    float hi = server.hasArg("tgtmax") ? server.arg("tgtmax").toFloat() : targetMax();
+    setTargetBand(lo, hi);
+  }
   if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
   if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
   if (server.hasArg("leadfall"))
