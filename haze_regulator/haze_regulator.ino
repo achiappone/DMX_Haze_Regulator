@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.05.001"
+#define FW_VERSION "1.06.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -375,6 +375,59 @@ const Preset PRESETS[] = {
     {"Responsive", 10, 100, 100, 3, 5},
 };
 const size_t PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
+
+// Solve the model the loop already assumes for the one constant it cannot
+// trust. A calibration measures one plume on one afternoon: it read 16.71/s
+// here from the peak of a full-power burst crossing the sensor, while the
+// steady state said 5.5 - and doseCap, sized on the first number, held output
+// at 8% while the room sat 100 below the band for half an hour. Doors open,
+// the HVAC changes, fluid runs low; a number measured once stops describing
+// the room. Given a window of its own output and the level that output
+// produced, the loop can work out the truth.
+//   d(level)/dt = rise * duty - level / tau
+// Pure, so the arithmetic can be tested without waiting ten minutes for it.
+float riseEstimate(float lvlStart, float lvlEnd, float lvlAvg, float dutyAvg,
+                   float dt, int tau) {
+  if (dutyAvg < 0.01f || tau <= 0 || dt <= 0) return 0.0f;
+  return ((lvlEnd - lvlStart) / dt + lvlAvg / tau) / dutyAvg;
+}
+
+// Ten minutes of evidence per update, and only 15% of each estimate believed.
+// This corrects drift over hours; anything faster would be a second control
+// loop fighting the first one.
+#define ADAPT_WIN 600
+#define ADAPT_BLEND 0.15f
+float adaptDuty = 0, adaptLvl = 0, adaptStart = 0;
+int adaptN = 0;
+unsigned long adaptT0 = 0;
+
+void adaptReset(unsigned long now, float lvl) {
+  adaptDuty = adaptLvl = 0;
+  adaptN = 0;
+  adaptStart = lvl;
+  adaptT0 = now;
+}
+
+void adaptTick(unsigned long now, float lvl, int duty) {
+  if (!adaptT0) { adaptReset(now, lvl); return; }
+  adaptDuty += duty;
+  adaptLvl += lvl;
+  adaptN++;
+  if (adaptN < 5 || now - adaptT0 < (unsigned long)ADAPT_WIN * 1000) return;
+  float est = riseEstimate(adaptStart, lvl, adaptLvl / adaptN,
+                           adaptDuty / adaptN / 100.0f,
+                           (now - adaptT0) / 1000.0f, cfg.integralTi);
+  // A window that saw almost no output, or that implies something absurd, is
+  // evidence of nothing. Drop it rather than letting it move the constant.
+  if (est > 0.2f && est < 200.0f) {
+    float was = cfg.riseRate;
+    cfg.riseRate += (est - cfg.riseRate) * ADAPT_BLEND;
+    logEvent("rise %.2f -> %.2f/s (10 min window said %.2f)", (double)was,
+             (double)cfg.riseRate, (double)est);
+    saveAt = now + 2000;
+  }
+  adaptReset(now, lvl);
+}
 
 uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
   if (riseRate <= 0 || deadTime <= 0) return 100;  // uncalibrated: no opinion
@@ -820,6 +873,13 @@ void selfTest() {
   CHECK(doseCap(1000, 20.0f, 20, 100) == 100);   // huge deficit, still capped
   CHECK(doseCap(150, 0.0f, 20, 100) == 100);     // uncalibrated: no cap
   CHECK(doseCap(150, 20.0f, 20, 50) == 19);      // half-dose setting
+  // Adaptive rise. Holding level at 100 with 5% duty and a 400s decay means
+  // the machine is replacing 0.25/s with 0.05 of its full output: 5.0/s.
+  CHECK(fabsf(riseEstimate(100, 100, 100, 0.05f, 600, 400) - 5.0f) < 0.01f);
+  // Same duty but still climbing 0.1/s means it is stronger than that.
+  CHECK(fabsf(riseEstimate(100, 160, 130, 0.05f, 600, 400) - 8.5f) < 0.01f);
+  CHECK(riseEstimate(100, 100, 100, 0.0f, 600, 400) == 0.0f);    // no output, no evidence
+  CHECK(riseEstimate(100, 100, 100, 0.05f, 600, 0) == 0.0f);     // no decay constant
   // Falling 0.62/s for 90s adds ~56 to a 135 deficit
   // 190.8 projected, but capped at the setpoint by the clause above
   // setTargetBand writes live config, so put it back afterwards. Today this
@@ -1673,6 +1733,16 @@ void handleSet() {
   }
   if (server.hasArg("pulse")) cfg.pulseMode = server.arg("pulse").toInt();
   if (server.hasArg("autopurge")) cfg.autoPurge = server.arg("autopurge").toInt();
+  // riseRate could only ever be written by calibration, so a calibration that
+  // measured the wrong thing could not be corrected without running another
+  // one. It measures the peak of a full-power plume crossing the sensor, which
+  // is not what the room does over minutes: measured here, the plume said
+  // 16.71/s while the steady state said 5.5/s, and doseCap sized on the former
+  // held output at 8% while the room sat 100 below the band for half an hour.
+  if (server.hasArg("rise")) {
+    cfg.riseRate = constrain(server.arg("rise").toFloat(), 0.0f, 500.0f);
+    logEvent("rise rate set to %.2f/s by hand", (double)cfg.riseRate);
+  }
   if (server.hasArg("preset")) {
     const Preset &pr = PRESETS[constrain(server.arg("preset").toInt(), 0,
                                          (int)PRESET_COUNT - 1)];
@@ -2062,6 +2132,16 @@ void loop() {
       predicted = predict(pmFilt, pmSlope,
                           leadFor(pmSlope, cfg.leadFall, cfg.leadRise));
       predicted = controlPm(predicted, pmFilt, cfg.setpoint, cfg.deadband);
+
+      // Only learn from ordinary regulating. A purge, a calibration pulse, a
+      // stopped output or a pegged sensor are all the loop not being in charge
+      // of what the room is doing, and a window containing one of them would
+      // teach it something false.
+      if (!cfg.stopped && cfg.automatic && !purging() && !calibrating() &&
+          !sensorSaturated())
+        adaptTick(now, pmFilt, hazeLevel());
+      else
+        adaptReset(now, pmFilt);
     }
     // A pegged sensor cannot report a trend, so the regulator is flying blind
     // and any output it commands is guesswork. Clear the air instead. Not during
