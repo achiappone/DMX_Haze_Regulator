@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.11.000"
+#define FW_VERSION "1.11.004"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1013,8 +1013,11 @@ void selfTest() {
 }
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Haze Regulator</title>
-<link rel=icon href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141414'/%3E%3Crect x='5' y='19' width='22' height='3' rx='1.5' fill='%234a9966' opacity='.55'/%3E%3Cpath d='M9 17c0-4 4-3 4-7 0-2-1-3-1-3 4 1 6 4 6 7 0 1 1 2 2 1 1 3-2 5-5 5-3 0-6-1-6-3z' fill='%2344aa99'/%3E%3C/svg%3E">
+<title>Haze Regulator - Chauvet Professional</title>
+<!-- A C lettermark, not the Chauvet logo: the artwork is not in this repo and
+     drawing a trademark from memory gets it subtly wrong in a way that looks
+     worse than plain type. Drop the real SVG in and swap the href. -->
+<link rel=icon href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141414'/%3E%3Cpath d='M22.5 10.2a8.6 8.6 0 1 0 0 11.6' fill='none' stroke='%23ffffff' stroke-width='4.3' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 html{background:#0a0a0a}
 body{font:15px system-ui;margin:22px auto;max-width:1600px;padding:22px 28px;
@@ -1199,8 +1202,15 @@ function flush(){
 // History lives on the ESP32, so a reload is a new view of the same trend
 // rather than a fresh start, and the regulator keeps recording with no browser
 // open at all.
-let winSec=600,offSec=0,spanSec=0,HIST=null;
-function setWin(v){winSec=+v;clampPan();loadHist();}
+// The chart window is a per-person habit, not device state: two people can
+// watch the same board wanting different windows, and it is not worth an NVS
+// write per dropdown change. localStorage can throw in a private window, and
+// the chart has to come up regardless, so every access is guarded.
+function remembered(k,d){try{const v=localStorage.getItem('haze.'+k);
+  return v===null?d:+v;}catch(e){return d}}
+function remember(k,v){try{localStorage.setItem('haze.'+k,v)}catch(e){}}
+let winSec=remembered('win',600),offSec=0,spanSec=0,HIST=null;
+function setWin(v){winSec=+v;remember('win',winSec);clampPan();loadHist();}
 // The slider spans whatever history exists, not a nominal week: most of a
 // 7 day track would be empty on a board that booted this morning.
 function clampPan(){const m=Math.max(0,spanSec-winSec);
@@ -1310,10 +1320,17 @@ function draw(){
   ctx.fillText('showing '+(oldest>=3600?(oldest/3600).toFixed(1)+' h':
     oldest>=60?Math.round(oldest/60)+' min':Math.round(oldest)+' s')+
     ' of '+n+' points',ML,h-8);
-  ctx.textAlign='right';ctx.fillStyle='#4a9';ctx.fillText('PM2.5',ML-8,12);
-  ctx.fillStyle='#79c0ff';ctx.fillText('PM1.0',ML-8,24);
-  ctx.fillStyle='#c792ea';ctx.fillText('PM10',ML-8,36);
-  ctx.textAlign='left';ctx.fillStyle='#e94';ctx.fillText('haze',ML+pw+8,12);
+  // Laid out left to right across the top margin, each label placed after the
+  // measured width of the one before it. Stacked in the left gutter they
+  // collided with each other and with the axis values, and the gutter is only
+  // 36px on a phone.
+  ctx.textAlign='left';
+  let lx=ML;
+  for(const[t,col]of[['PM2.5','#4a9'],['PM1.0','#79c0ff'],['PM10','#c792ea'],
+                     ['haze %','#e94']]){
+    ctx.fillStyle=col;ctx.fillText(t,lx,12);
+    lx+=ctx.measureText(t).width+14;
+  }
 }
 addEventListener('resize',draw);
 async function loadEvents(){
@@ -1322,6 +1339,9 @@ async function loadEvents(){
       evt.scrollTop=evt.scrollHeight;}catch(e){}
 }
 evtwrap.addEventListener('toggle',loadEvents);
+// Reflect the remembered window in the dropdown before the first fetch, or the
+// control says 10 minutes while the chart draws something else.
+win.value=winSec;
 setInterval(loadEvents,5000);
 setInterval(loadHist,1000);loadHist();
 async function tick(){
