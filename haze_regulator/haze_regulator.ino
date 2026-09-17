@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.17.000"
+#define FW_VERSION "1.19.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -110,8 +110,26 @@ unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // took a CSV export and arithmetic. The board knows both numbers - it should
 // say so.
 unsigned long capSince = 0, capLogged = 0;
+
+// doseCap is only as good as riseRate and the decay constant, and those are two
+// unknowns against one equation: the adaptive estimator solves for the rise
+// rate given the decay constant, and nothing solves for the decay constant. Get
+// it wrong and the cap refuses output the room genuinely needs - measured here,
+// the controller asking for 100% while the cap allowed 12%, the room 70 below
+// its band, and 18% demand losing 51 units over ninety seconds.
+//
+// Evidence beats the model. Capped, below the band and not rising can only mean
+// the cap is too tight, whichever constant is wrong, and that judgement needs no
+// constants at all. So relax it - slowly, bounded, and give it all back once the
+// band is reached, because this is a correction for a bad model rather than a
+// second controller.
+#define CAP_RELAX_MAX 4.0f
+float capRelax = 1.0f;
+float relaxRef = 0;
+unsigned long relaxAt = 0, relaxLogged = 0;
 #define UI_PATH "/index.html"
 #define UI_TMP "/index.new"
+#define UI_BAK "/index.bak"
 File uiTmp;
 bool uiUploadOk = false;
 bool uiFromFs();
@@ -1064,10 +1082,19 @@ button,input{font:inherit;background:#2e2e2e;color:#eee;border:1px solid #444;bo
 <h1>Haze Regulator - recovery page</h1>
 <p class=w>The full interface is not on the filesystem. The controller is
 running normally - only the page is missing. Upload one, or run ./ui.sh</p>
+<p><button onclick="location.reload()">Retry</button>
+<button onclick="r()">Restore previous interface</button>
+<i id=m style=color:#888></i></p>
 <form method=POST action=/ui enctype=multipart/form-data>
 <input type=file name=ui accept=text/html><button>Upload interface</button></form>
 <pre id=s>loading...</pre>
 <script>
+// Restore first, upload second: putting back a page that worked an hour ago
+// needs no laptop, no toolchain and no network beyond this one request.
+function r(){m.textContent='restoring...';
+  fetch('/ui/restore').then(x=>x.text()).then(t=>{m.textContent=t;
+    if(t=='restored')setTimeout(()=>location.reload(),600)})
+  .catch(e=>m.textContent='failed')}
 const f=()=>fetch('/api/state').then(r=>r.json()).then(d=>{
   s.textContent=Object.entries(d).map(([k,v])=>k+': '+v).join('\n')}).catch(e=>0);
 f();setInterval(f,2000);
@@ -1166,7 +1193,7 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
-           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"caprelax\":%.2f,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
@@ -1191,7 +1218,7 @@ void handleState() {
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
-           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0,
+           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax,
            cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
@@ -1739,7 +1766,12 @@ void setup() {
                   // Swap in only once the whole thing has arrived, so a dropped
                   // connection leaves the previous page untouched rather than
                   // half of the new one.
-                  LittleFS.remove(UI_PATH);
+                  // Keep the page that was working before replacing it. The
+                  // recovery page can only put something back if something was
+                  // kept, and the moment a replacement is about to happen is
+                  // the only moment the old one is still known good.
+                  LittleFS.remove(UI_BAK);
+                  if (LittleFS.exists(UI_PATH)) LittleFS.rename(UI_PATH, UI_BAK);
                   uiUploadOk = LittleFS.rename(UI_TMP, UI_PATH);
                 }
               } else if (up.status == UPLOAD_FILE_ABORTED) {
@@ -1747,6 +1779,18 @@ void setup() {
                 LittleFS.remove(UI_TMP);
               }
             });
+  server.on("/ui/restore", []() {
+    if (!authOk()) return;
+    if (!LittleFS.exists(UI_BAK)) {
+      server.send(200, "text/plain", "no backup on the filesystem");
+      return;
+    }
+    LittleFS.remove(UI_PATH);
+    bool ok = LittleFS.rename(UI_BAK, UI_PATH);
+    server.send(200, "text/plain", ok ? "restored" : "restore failed");
+    logEvent(ok ? "web ui restored from the backup copy"
+                : "web ui restore from backup failed");
+  });
   server.on("/ui/reset", []() {
     if (!authOk()) return;
     LittleFS.remove(UI_PATH);
@@ -2132,6 +2176,30 @@ void loop() {
           doseCap(deficitAtArrival(cfg.setpoint, pmFilt, pmSlope, cfg.deadTime) +
                       holdLoss(pmFilt, cfg.integralTi, cfg.deadTime),
                   cfg.riseRate, cfg.deadTime, cfg.dosePct);
+      // Once a minute, ask whether the cap is standing between the loop and its
+      // target. Rising counts as working even if it has not arrived yet.
+      if (now - relaxAt > 60000) {
+        bool starved = target > cap && pmFilt < targetMin() &&
+                       pmFilt <= relaxRef + 1.0f;
+        if (relaxAt && starved && capRelax < CAP_RELAX_MAX) {
+          capRelax = min(CAP_RELAX_MAX, capRelax * 1.15f);
+          if (now - relaxLogged > 300000) {
+            relaxLogged = now;
+            logEvent("cap relaxed to %.2fx: capped at %u%% with %.0f below the "
+                     "band and not rising", (double)capRelax, cap,
+                     (double)(targetMin() - pmFilt));
+          }
+        } else if (pmFilt >= targetMin() && capRelax > 1.0f) {
+          // Reached the band, so the model is no longer demonstrably wrong.
+          capRelax = max(1.0f, capRelax * 0.9f);
+        }
+        relaxRef = pmFilt;
+        relaxAt = now;
+      }
+      if (capRelax > 1.0f) {
+        long widened = lroundf(cap * capRelax);
+        cap = widened > 100 ? 100 : (uint8_t)widened;
+      }
       if (target > cap) {
         // Only a clip big enough to matter, held long enough to not be a
         // transient, and at most once every five minutes.
