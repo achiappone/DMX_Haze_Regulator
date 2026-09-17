@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <Wire.h>
 #include <assert.h>
 #include <string.h>
@@ -37,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.23.001"
+#define FW_VERSION "1.25.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -166,6 +167,12 @@ uint32_t servedReqs = 0;     // requests handleClient actually did work for
 uint32_t slowestReqMs = 0;   // worst single response since boot
 uint32_t reqMsTotal = 0;     // summed response time, for an average
 unsigned long starvedSince = 0, reassocAt = 0;
+// RF history, because the radio is where two of this board's outages actually
+// lived. RSSI alone said -81 while it was failing and -85 would not have
+// tripped; which AP, which channel and which PHY rate it settled on is what
+// distinguishes a weak link from a bad association.
+uint16_t reassocCount = 0;
+unsigned long assocAt = 0;
 uint8_t slowReqs = 0;  // consecutive responses that crawled
 // Calibration measures the three numbers that are properties of the room, not
 // the equipment: how long haze takes to arrive, how fast it accumulates at full
@@ -343,6 +350,23 @@ void importOld(const char *path, int rec) {
 }
 
 bool uiFromFs() { return fsOk && LittleFS.exists(UI_PATH); }
+
+// The negotiated PHY, which is the first thing to fall back on a marginal link:
+// 11n gives tens of megabits, 11b gives one, and the page is 30KB.
+const char *phyMode() {
+  wifi_ap_record_t ap;
+  if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return "?";
+  if (ap.phy_11n) return "11n";
+  if (ap.phy_11g) return "11g";
+  if (ap.phy_11b) return "11b";
+  return "?";
+}
+
+double txPowerDbm() {
+  int8_t p = 0;
+  if (esp_wifi_get_max_tx_power(&p) != ESP_OK) return 0;
+  return p / 4.0;  // reported in quarter dBm
+}
 
 uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
@@ -1163,7 +1187,7 @@ void selfTest() {
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Haze Regulator - recovery</title>
+<title>HAZE_B_STDY - recovery</title>
 <style>body{font:15px system-ui;background:#141414;color:#eee;margin:0;padding:20px}
 h1{font-size:17px;margin:0 0 10px}
 pre{background:#1c1c1c;padding:10px;border-radius:8px;overflow:auto;font-size:12px;line-height:1.5}
@@ -1291,6 +1315,8 @@ void handleState() {
            "\"psfree\":%u,\"pstotal\":%u,"
            "\"sketch\":%u,\"flashfree\":%u,\"fsused\":%u,\"fstotal\":%u,"
            "\"chiptemp\":%.1f,"
+           "\"bssid\":\"%s\",\"chan\":%d,\"phy\":\"%s\",\"txp\":%.1f,"
+           "\"reassoc\":%u,\"assoc\":%lu,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
@@ -1324,7 +1350,9 @@ void handleState() {
            (unsigned)ESP.getFreeSketchSpace(),
            (unsigned)(fsOk ? LittleFS.usedBytes() : 0),
            (unsigned)(fsOk ? LittleFS.totalBytes() : 0),
-           (double)temperatureRead(),
+           (double)temperatureRead(), WiFi.BSSIDstr().c_str(), WiFi.channel(),
+           phyMode(), txPowerDbm(), (unsigned)reassocCount,
+           (unsigned long)(assocAt ? (millis() - assocAt) / 1000 : 0),
            cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
@@ -1571,6 +1599,48 @@ void handleCsv() {
   server.sendContent("");
 }
 
+// Plain settings: a name, where it goes, and the range it must land in. As a
+// chain of hasArg/arg/constrain this was 15.7KB of compiled code for one
+// function - the largest in the firmware - because every entry built a String,
+// compared it, constrained it and destructed it, inlined forty times over. The
+// table is the same forty facts with one copy of the machinery.
+//
+// Anything with a consequence beyond assignment - resetting the integral,
+// rescaling a constant, writing NVS, starting a calibration - stays written out
+// below, where the consequence is visible next to the cause.
+struct IntSetting {
+  const char *name;
+  int *target;
+  int lo, hi;
+};
+struct FloatSetting {
+  const char *name;
+  float *target;
+  float lo, hi;
+};
+
+const IntSetting INT_SETTINGS[] = {
+    {"slew", &cfg.slew, 1, 100},
+    {"leadfall", &cfg.leadFall, 0, 120},
+    {"leadrise", &cfg.leadRise, 0, 120},
+    {"dosepct", &cfg.dosePct, 10, 200},
+    {"dtau", &cfg.decayTau, 5, 1800},
+    {"ti", &cfg.integralTi, 0, 1800},
+    {"risecut", &cfg.riseCut, 0, 50},
+    {"floor", &cfg.floorPct, 0, 50},
+    {"tail", &cfg.machineTail, 0, 15},
+    {"tau", &cfg.filterTau, 0, 120},
+    {"fan", &cfg.fan, 0, 100},
+    {"plevel", &cfg.pulseLevel, 10, 100},
+    {"pminon", &cfg.pulseMinOn, 1, 10},
+    {"calpulse", &cfg.calPulse, 30, 600},
+    {"pperiod", &cfg.pulsePeriod, 5, 60},
+};
+const FloatSetting FLOAT_SETTINGS[] = {
+    {"gain", &cfg.gain, 0.1f, 10.0f},
+    {"deadband", &cfg.deadband, 0.0f, 100.0f},
+};
+
 void handleSet() {
   if (!authOk()) return;
   if (server.hasArg("automatic")) {
@@ -1578,7 +1648,16 @@ void handleSet() {
     cfg.automatic = server.arg("automatic").toInt();
     if (was != cfg.automatic) logEvent("mode -> %s", cfg.automatic ? "AUTO" : "MANUAL");
   }
-  if (server.hasArg("manual")) cfg.manual = constrain(server.arg("manual").toInt(), 0, 100);
+  // manual is a uint8_t, so it does not fit the int table and is not worth
+  // widening the field for.
+  if (server.hasArg("manual"))
+    cfg.manual = constrain((int)server.arg("manual").toInt(), 0, 100);
+  for (const IntSetting &a : INT_SETTINGS)
+    if (server.hasArg(a.name))
+      *a.target = constrain((int)server.arg(a.name).toInt(), a.lo, a.hi);
+  for (const FloatSetting &a : FLOAT_SETTINGS)
+    if (server.hasArg(a.name))
+      *a.target = constrain(server.arg(a.name).toFloat(), a.lo, a.hi);
   if (server.hasArg("source")) {
     int sc = constrain(server.arg("source").toInt(), 0, 2);
     if (sc != cfg.source) {
@@ -1651,8 +1730,6 @@ void handleSet() {
     // it would otherwise keep commanding the old one long after the change.
     if (fabsf(cfg.setpoint - was) > fmaxf(2.0f, was * 0.1f)) integ = 0;
   }
-  if (server.hasArg("deadband"))
-    cfg.deadband = constrain(server.arg("deadband").toFloat(), 0.0f, 100.0f);
   // After the raw pair, so a client sending both wins with the band. The page
   // coalesces edits into one request, so min and max can arrive together.
   if (server.hasArg("tgtmin") || server.hasArg("tgtmax")) {
@@ -1660,12 +1737,6 @@ void handleSet() {
     float hi = server.hasArg("tgtmax") ? server.arg("tgtmax").toFloat() : targetMax();
     setTargetBand(lo, hi);
   }
-  if (server.hasArg("gain")) cfg.gain = constrain(server.arg("gain").toFloat(), 0.1f, 10.0f);
-  if (server.hasArg("slew")) cfg.slew = constrain(server.arg("slew").toInt(), 1, 100);
-  if (server.hasArg("leadfall"))
-    cfg.leadFall = constrain(server.arg("leadfall").toInt(), 0, 120);
-  if (server.hasArg("leadrise"))
-    cfg.leadRise = constrain(server.arg("leadrise").toInt(), 0, 120);
   if (server.hasArg("epoch")) {
     time_t e = (time_t)server.arg("epoch").toInt();
     if (e > 1700000000 && time(nullptr) < 1700000000) {
@@ -1674,8 +1745,6 @@ void handleSet() {
       logEvent("clock set from browser");
     }
   }
-  if (server.hasArg("dosepct"))
-    cfg.dosePct = constrain(server.arg("dosepct").toInt(), 10, 200);
   if (server.hasArg("room") || server.hasArg("air") || server.hasArg("temp")) {
     if (server.hasArg("room"))
       cfg.roomSize = constrain(server.arg("room").toInt(), 0, 2);
@@ -1694,19 +1763,6 @@ void handleSet() {
                cfg.roomTempF, (double)cfg.riseRate, cfg.decayTau);
     }
   }
-  if (server.hasArg("dtau"))
-    cfg.decayTau = constrain(server.arg("dtau").toInt(), 5, 1800);
-  if (server.hasArg("ti"))
-    cfg.integralTi = constrain(server.arg("ti").toInt(), 0, 1800);
-  if (server.hasArg("risecut"))
-    cfg.riseCut = constrain(server.arg("risecut").toInt(), 0, 50);
-  if (server.hasArg("floor"))
-    cfg.floorPct = constrain(server.arg("floor").toInt(), 0, 50);
-  if (server.hasArg("tail"))
-    cfg.machineTail = constrain(server.arg("tail").toInt(), 0, 15);
-  if (server.hasArg("tau"))
-    cfg.filterTau = constrain(server.arg("tau").toInt(), 0, 120);
-  if (server.hasArg("fan")) cfg.fan = constrain(server.arg("fan").toInt(), 0, 100);
   if (server.hasArg("save")) {
     saveAt = 0;  // explicit save: write now rather than on the debounce
     saveCfg();
@@ -1739,14 +1795,6 @@ void handleSet() {
     logEvent("preset %s: tau %d, burst %d%%, dose %d%%, slew %d, risecut %d",
              pr.name, pr.tau, pr.plevel, pr.dosePct, pr.slew, pr.riseCut);
   }
-  if (server.hasArg("plevel"))
-    cfg.pulseLevel = constrain(server.arg("plevel").toInt(), 10, 100);
-  if (server.hasArg("pminon"))
-    cfg.pulseMinOn = constrain(server.arg("pminon").toInt(), 1, 10);
-  if (server.hasArg("calpulse"))
-    cfg.calPulse = constrain(server.arg("calpulse").toInt(), 30, 600);
-  if (server.hasArg("pperiod"))
-    cfg.pulsePeriod = constrain(server.arg("pperiod").toInt(), 5, 60);
   if (server.hasArg("calibrate")) {
     if (server.arg("calibrate").toInt()) {
       // Calibration drives the hazer, and the stopped branch in loop() resets
@@ -1880,6 +1928,7 @@ void setup() {
     Serial.printf("\nhttp://%s/  (or http://haze.local/)\n",
                   WiFi.localIP().toString().c_str());
     MDNS.begin("haze");
+    assocAt = millis();  // first association, not only reconnections
   } else {
     Serial.println("\nno wifi - regulating headless, will keep retrying");
     wifiLostAt = millis();
@@ -2186,6 +2235,7 @@ void loop() {
       reassocAt = now;
       logEvent("WATCHDOG: %u slow responses, rssi %d - reassociating",
                (unsigned)slowReqs, (int)WiFi.RSSI());
+      reassocCount++;
       slowReqs = 0;
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -2458,6 +2508,7 @@ void loop() {
     wifiLostAt = 0;
     MDNS.end();
     MDNS.begin("haze");
+    assocAt = millis();
     logEvent("wifi reconnected, ip %s rssi %d",
              WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
   }

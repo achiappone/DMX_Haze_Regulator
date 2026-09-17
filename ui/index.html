@@ -1,5 +1,5 @@
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Chauvet Pro-Haze-B-Steady</title>
+<title>Chauvet HAZE_B_STDY</title>
 <!-- A C lettermark, not the Chauvet logo: the artwork is not in this repo and
      drawing a trademark from memory gets it subtly wrong in a way that looks
      worse than plain type. Drop the real SVG in and swap the href. -->
@@ -63,7 +63,7 @@ input:disabled{cursor:not-allowed}
 .leg{font-size:11px;color:#777;margin:4px 0 10px;display:flex;gap:12px}
 .leg i{font-style:normal}
 </style>
-<div class=brand><span class=b1>CHAUVET</span><span class=b2>Pro-Haze-B-Steady</span></div>
+<div class=brand><span class=b1>CHAUVET</span><span class=b2>HAZE_B_STDY</span></div>
 <h1>Haze Regulator</h1>
 <div class=g>
 <div class=c><span>PM2.5 ug/m3</span><b id=pm25 class=s25>-</b></div>
@@ -467,8 +467,14 @@ async function tick(){
     ['psram used',used(s.psfree,s.pstotal)],
     ['sketch',K(s.sketch)],['ota space free',K(s.flashfree)],
     ['filesystem',K(s.fsused)+' / '+K(s.fstotal)],
-    ['chip temp',s.chiptemp+' \u00b0C'],['wifi',s.rssi+' dBm'],
-    ['cap relax',s.caprelax+'x']]
+    ['chip temp',s.chiptemp+' \u00b0C'],['cap relax',s.caprelax+'x'],
+    // RF, because the radio is where two outages actually lived. RSSI alone
+    // read -81 while the page was serving 71 bytes a second; the PHY rate and
+    // which AP it settled on are what tell a weak link from a bad association.
+    ['wifi signal',s.rssi+' dBm'],['wifi rate',s.phy],
+    ['wifi channel',s.chan],['access point',s.bssid],
+    ['tx power',s.txp+' dBm'],
+    ['associated for',ago(s.assoc)],['reassociations',s.reassoc]]
     .map(([a,b])=>'<div class=c><span>'+a+'</span><b>'+b+'</b></div>').join('');
   apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon; vpl.textContent=s.plevel;
   pulsebtn.className=s.pulse?'on':'';
