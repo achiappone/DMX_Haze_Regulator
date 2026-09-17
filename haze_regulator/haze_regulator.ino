@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.20.000"
+#define FW_VERSION "1.21.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -84,6 +84,12 @@ struct {
   int floorPct = 10;     // never command less than this when well below target
   int riseCut = 3;       // ug/m3/s climb that latches output off; 0 = disabled
   int integralTi = 300;  // integral time, seconds; 0 = proportional only
+  // How fast the room clears, which is a property of the room, not a tuning
+  // knob. It was sharing integralTi - a reading of "the integral should track
+  // the room" that is defensible until you need to detune the integral for
+  // stability and find you have moved the leak model and the rise estimator
+  // with it. Two different things that happened to start with one number.
+  int decayTau = 300;
   float riseRate = 0;    // signal units per second at 100% output, from calibration
   // What was asked for on each control signal, kept per signal so switching
   // between them is lossless. Converting by the measured ratio instead lost up
@@ -508,7 +514,7 @@ float riseEstimate(float lvlStart, float lvlEnd, float lvlAvg, float dutyAvg,
 // This corrects drift over hours; anything faster would be a second control
 // loop fighting the first one.
 #define ADAPT_WIN 600
-#define ADAPT_BLEND 0.15f
+#define ADAPT_BLEND 0.10f
 float adaptDuty = 0, adaptLvl = 0, adaptStart = 0;
 int adaptN = 0;
 unsigned long adaptT0 = 0;
@@ -526,9 +532,22 @@ void adaptTick(unsigned long now, float lvl, int duty) {
   adaptLvl += lvl;
   adaptN++;
   if (adaptN < 5 || now - adaptT0 < (unsigned long)ADAPT_WIN * 1000) return;
-  float est = riseEstimate(adaptStart, lvl, adaptLvl / adaptN,
+  float lvlAvg = adaptLvl / adaptN;
+  // Learn from steady windows only. Feeding transients back into riseRate
+  // closes a loop: a higher rise tightens the cap, which drops the output and
+  // the level, which the next window reads as a weaker machine, which widens
+  // the cap again - a limit cycle at twice the window length. Thirty minutes on
+  // PM2.5 hunted 174 -> 227 -> 148 with a 10-15 minute period, against a 10
+  // minute window. A window that moved more than a third of its own average was
+  // measuring the swing, not the machine.
+  float moved = fabsf(lvl - adaptStart);
+  if (lvlAvg > 1.0f && moved > 0.35f * lvlAvg) {
+    adaptReset(now, lvl);
+    return;
+  }
+  float est = riseEstimate(adaptStart, lvl, lvlAvg,
                            adaptDuty / adaptN / 100.0f,
-                           (now - adaptT0) / 1000.0f, cfg.integralTi);
+                           (now - adaptT0) / 1000.0f, cfg.decayTau);
   // A window that saw almost no output, or that implies something absurd, is
   // evidence of nothing. Drop it rather than letting it move the constant.
   if (est > 0.2f && est < 200.0f) {
@@ -668,7 +687,10 @@ void calFinish() {
   if (calNoise > 0) cfg.deadband = constrain((float)calNoise, 2.0f, 100.0f);
   // Integral time tracks the room's own decay constant: integrate no faster
   // than the process can actually respond, or the loop winds itself up.
-  if (calTau > 0) cfg.integralTi = constrain(calTau, 30, 1800);
+  if (calTau > 0) {
+    cfg.decayTau = constrain(calTau, 5, 1800);
+    cfg.integralTi = constrain(calTau, 30, 1800);
+  }
   // Feed the dose limiter: these are exactly the numbers it needs.
   cfg.riseRate = constrain(calRise, 0.0f, 500.0f);
   cfg.deadTime = constrain(calDead, 0, 300);
@@ -797,6 +819,7 @@ void saveCfg() {
   prefs.putInt("floor", cfg.floorPct);
   prefs.putInt("risecut", cfg.riseCut);
   prefs.putInt("ti", cfg.integralTi);
+  prefs.putInt("dtau", cfg.decayTau);
   prefs.putFloat("rise", cfg.riseRate);
   prefs.putInt("dead", cfg.deadTime);
   prefs.putInt("dosepct", cfg.dosePct);
@@ -833,6 +856,8 @@ void loadCfg() {
   cfg.floorPct = prefs.getInt("floor", cfg.floorPct);
   cfg.riseCut = prefs.getInt("risecut", cfg.riseCut);
   cfg.integralTi = prefs.getInt("ti", cfg.integralTi);
+  // Upgrades inherit the value the two used to share.
+  cfg.decayTau = prefs.getInt("dtau", cfg.integralTi);
   cfg.riseRate = prefs.getFloat("rise", cfg.riseRate);
   cfg.deadTime = prefs.getInt("dead", cfg.deadTime);
   cfg.dosePct = prefs.getInt("dosepct", cfg.dosePct);
@@ -861,6 +886,7 @@ void loadCfg() {
   cfg.floorPct = constrain(cfg.floorPct, 0, 50);
   cfg.riseCut = constrain(cfg.riseCut, 0, 50);
   cfg.integralTi = constrain(cfg.integralTi, 0, 1800);
+  cfg.decayTau = constrain(cfg.decayTau, 5, 1800);
   cfg.riseRate = constrain(cfg.riseRate, 0.0f, 500.0f);
   cfg.deadTime = constrain(cfg.deadTime, 0, 300);
   cfg.dosePct = constrain(cfg.dosePct, 10, 200);
@@ -1214,7 +1240,7 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
-           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"caprelax\":%.2f,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"caprelax\":%.2f,\"dtau\":%d,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
@@ -1239,7 +1265,7 @@ void handleState() {
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
-           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax,
+           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax, cfg.decayTau,
            cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
@@ -1591,6 +1617,8 @@ void handleSet() {
   }
   if (server.hasArg("dosepct"))
     cfg.dosePct = constrain(server.arg("dosepct").toInt(), 10, 200);
+  if (server.hasArg("dtau"))
+    cfg.decayTau = constrain(server.arg("dtau").toInt(), 5, 1800);
   if (server.hasArg("ti"))
     cfg.integralTi = constrain(server.arg("ti").toInt(), 0, 1800);
   if (server.hasArg("risecut"))
@@ -2216,7 +2244,7 @@ void loop() {
       // to overshoot a target that is already nearly reached.
       uint8_t cap =
           doseCap(deficitAtArrival(cfg.setpoint, pmFilt, pmSlope, cfg.deadTime) +
-                      holdLoss(pmFilt, cfg.integralTi, cfg.deadTime),
+                      holdLoss(pmFilt, cfg.decayTau, cfg.deadTime),
                   cfg.riseRate, cfg.deadTime, cfg.dosePct);
       // Once a minute, ask whether the cap is standing between the loop and its
       // target. Rising counts as working even if it has not arrived yet.
@@ -2254,7 +2282,7 @@ void loop() {
                      target, cap, (unsigned long)((now - capSince) / 1000),
                      (double)deficitAtArrival(cfg.setpoint, pmFilt, pmSlope,
                                               cfg.deadTime),
-                     (double)holdLoss(pmFilt, cfg.integralTi, cfg.deadTime),
+                     (double)holdLoss(pmFilt, cfg.decayTau, cfg.deadTime),
                      cfg.deadTime, (double)cfg.riseRate);
           }
         } else {
