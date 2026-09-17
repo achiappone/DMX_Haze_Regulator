@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.27.000"
+#define FW_VERSION "1.28.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -95,6 +95,14 @@ struct {
   int roomSize = 1;   // 0 small, 1 medium, 2 large
   int airMode = 0;    // 0 air conditioned / cycling, 1 static
   int roomTempF = 70;
+  // Whether these constants have ever been measured, as opposed to guessed from
+  // the room. A room size is a starting point; a measurement outranks it. The
+  // 1200 cu ft baseline replaced a rise rate the board had converged on over
+  // hours - 16/s measured, 48/s inferred - which made doseCap three times too
+  // tight and left capRelax clawing back to 2.66x while the level swung from 21
+  // to 293. One button should not be able to discard that silently.
+  bool riseLearned = false;
+  bool decayLearned = false;
   float riseRate = 0;    // signal units per second at 100% output, from calibration
   // What was asked for on each control signal, kept per signal so switching
   // between them is lossless. Converting by the measured ratio instead lost up
@@ -588,6 +596,7 @@ void adaptTick(unsigned long now, float lvl, int duty) {
   if (est > 0.2f && est < 200.0f) {
     float was = cfg.riseRate;
     cfg.riseRate += (est - cfg.riseRate) * ADAPT_BLEND;
+    cfg.riseLearned = true;
     logEvent("rise %.2f -> %.2f/s (10 min window said %.2f)", (double)was,
              (double)cfg.riseRate, (double)est);
     saveAt = now + 2000;
@@ -683,6 +692,7 @@ void decayTick(unsigned long now, float lvl, int demand, int wire) {
       // A quarter of each measurement, like the rise rate: this is drift, and
       // one quiet stretch is one sample of a room that changes.
       cfg.decayTau = (int)(cfg.decayTau + 0.25 * (tau - cfg.decayTau));
+      cfg.decayLearned = true;
       logEvent("decay fitted %ds over %ds of quiet air, tau %d -> %d", (int)tau,
                (int)t, was, cfg.decayTau);
       saveAt = now + 2000;
@@ -816,10 +826,12 @@ void calFinish() {
   // than the process can actually respond, or the loop winds itself up.
   if (calTau > 0) {
     cfg.decayTau = constrain(calTau, 5, 1800);
+    cfg.decayLearned = true;
     cfg.integralTi = constrain(calTau, 30, 1800);
   }
   // Feed the dose limiter: these are exactly the numbers it needs.
   cfg.riseRate = constrain(calRise, 0.0f, 500.0f);
+  cfg.riseLearned = true;
   cfg.deadTime = constrain(calDead, 0, 300);
   if (calRise > 0.01f) {
     // Lambda (IMC) tuning rather than Ziegler-Nichols. ZN assumes you can
@@ -950,6 +962,8 @@ void saveCfg() {
   prefs.putInt("room", cfg.roomSize);
   prefs.putInt("air", cfg.airMode);
   prefs.putInt("tempf", cfg.roomTempF);
+  prefs.putBool("rlrn", cfg.riseLearned);
+  prefs.putBool("dlrn", cfg.decayLearned);
   prefs.putFloat("rise", cfg.riseRate);
   prefs.putInt("dead", cfg.deadTime);
   prefs.putInt("dosepct", cfg.dosePct);
@@ -991,6 +1005,8 @@ void loadCfg() {
   cfg.roomSize = prefs.getInt("room", cfg.roomSize);
   cfg.airMode = prefs.getInt("air", cfg.airMode);
   cfg.roomTempF = prefs.getInt("tempf", cfg.roomTempF);
+  cfg.riseLearned = prefs.getBool("rlrn", false);
+  cfg.decayLearned = prefs.getBool("dlrn", false);
   cfg.riseRate = prefs.getFloat("rise", cfg.riseRate);
   cfg.deadTime = prefs.getInt("dead", cfg.deadTime);
   cfg.dosePct = prefs.getInt("dosepct", cfg.dosePct);
@@ -1373,7 +1389,7 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
-           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"uigen\":%u,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,\"baserise\":%.2f,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"uigen\":%u,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,\"baserise\":%.2f,\"rlearn\":%d,\"dlearn\":%d,"
            // Board health. minheap rather than heap alone: free heap at the
            // moment you looked says little, the low water mark since boot says
            // whether anything ever came close.
@@ -1409,6 +1425,7 @@ void handleState() {
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
            FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, uiGen, (double)capRelax, cfg.decayTau, cfg.roomSize,
            cfg.airMode, cfg.roomTempF, (double)baselineRise(cfg.roomSize),
+           cfg.riseLearned ? 1 : 0, cfg.decayLearned ? 1 : 0,
            (unsigned)ESP.getFreeHeap(),
            (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getHeapSize(),
            (unsigned)(servedReqs ? reqMsTotal / servedReqs : 0),
@@ -1727,6 +1744,9 @@ void handleSet() {
   for (const FloatSetting &a : FLOAT_SETTINGS)
     if (server.hasArg(a.name))
       *a.target = constrain(server.arg(a.name).toFloat(), a.lo, a.hi);
+  // dtau goes through the table, but setting it by hand is still a claim that
+  // somebody measured the room rather than guessed at it.
+  if (server.hasArg("dtau")) cfg.decayLearned = true;
   if (server.hasArg("source")) {
     int sc = constrain(server.arg("source").toInt(), 0, 2);
     if (sc != cfg.source) {
@@ -1822,14 +1842,31 @@ void handleSet() {
     if (server.hasArg("temp"))
       cfg.roomTempF = constrain(server.arg("temp").toInt(), 32, 120);
     if (server.hasArg("apply")) {
-      cfg.riseRate = baselineRise(cfg.roomSize);
-      cfg.decayTau = baselineTau(cfg.roomSize, cfg.airMode, cfg.roomTempF);
+      // A starting point fills in blanks; it does not overrule a measurement.
+      // force=1 is the deliberate override, and says so in the log.
+      bool force = server.hasArg("force") && server.arg("force").toInt();
+      float bRise = baselineRise(cfg.roomSize);
+      int bTau = baselineTau(cfg.roomSize, cfg.airMode, cfg.roomTempF);
+      if (force || !cfg.riseLearned) {
+        cfg.riseRate = bRise;
+        cfg.riseLearned = false;
+      } else {
+        logEvent("room baseline: kept measured rise %.1f/s over baseline %.1f/s",
+                 (double)cfg.riseRate, (double)bRise);
+      }
+      if (force || !cfg.decayLearned) {
+        cfg.decayTau = bTau;
+        cfg.decayLearned = false;
+      }
       // Seed every signal, not just the one selected. riseBy is per signal, so
       // seeding only the current one left the others holding whatever stale
       // number they were last abandoned with - and switching to one of those
       // started cold on a board that had just been told about the room.
+      // Seed signals that have nothing, always. A signal already holding a
+      // value keeps it unless this is a forced replacement.
       float here = signalValue(cfg.source);
       for (int i = 0; i < 3; i++) {
+        if (cfg.riseBy[i] > 0 && !force && i != cfg.source) continue;
         float there = signalValue(i);
         cfg.riseBy[i] = (here > 1.0f && there > 1.0f)
                             ? cfg.riseRate * (there / here)
@@ -1861,6 +1898,7 @@ void handleSet() {
   // held output at 8% while the room sat 100 below the band for half an hour.
   if (server.hasArg("rise")) {
     cfg.riseRate = constrain(server.arg("rise").toFloat(), 0.0f, 500.0f);
+    cfg.riseLearned = true;  // typed in from a measurement, not from a room size
     logEvent("rise rate set to %.2f/s by hand", (double)cfg.riseRate);
   }
   if (server.hasArg("preset")) {

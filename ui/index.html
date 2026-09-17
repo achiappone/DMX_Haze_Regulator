@@ -137,7 +137,8 @@ them from there.</p>
 <div class=row><span class=bl>Temp</span>
 <input type=number id=tempf min=32 max=120 onchange="post('temp',this.value)">
 <span style=color:#888;font-size:13px>&deg;F</span>
-<button onclick="applyRoom()">Apply baseline</button>
+<button onclick="applyRoom(0)">Apply baseline</button>
+<button id=forcebtn onclick="applyRoom(1)" style=display:none>Replace measured</button>
 <i id=roomlbl style=color:#888;font-size:12px></i></div>
 </details>
 <details><summary>Tuning</summary>
@@ -202,8 +203,12 @@ let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
 function ug(v){return v<10?(+v).toFixed(2).replace(/0+$/,'').replace(/\.$/,''):Math.round(v)}
 // Applied together: post() coalesces into one request, so the board sets all
 // four and recomputes once rather than four times.
-function applyRoom(){post('room',room.value);post('air',air.value);
-  post('temp',tempf.value);post('apply',1);}
+// Apply fills in what has never been measured. Replacing something the board
+// worked out for itself is a separate button, because it is a separate
+// decision - the small-room baseline once discarded hours of adaptation in one
+// click and the loop spent the next half hour clawing it back.
+function applyRoom(force){post('room',room.value);post('air',air.value);
+  post('temp',tempf.value);if(force)post('force',1);post('apply',1);}
 const K=v=>Math.round(v/1024)+'K';
 function ago(v){return v>=3600?(v/3600|0)+'h '+((v%3600)/60|0)+'m':v>=60?(v/60|0)+'m':v+'s'}
 document.querySelectorAll('input[type=range]').forEach(e=>{
@@ -472,9 +477,12 @@ async function tick(){
   // seeing rather than silently overriding the number you typed.
   {const ft=[1200,3600,7000][s.room]||3600;
    const impl=s.rise>0.01?Math.round(ft*(s.baserise/s.rise)/100)*100:0;
-   roomlbl.textContent='baseline '+s.baserise+'/s, learned '+s.rise+'/s'+
-     (impl&&Math.abs(impl-ft)/ft>0.2?' - behaves like ~'+impl+' cu ft':'')+
-     ', decay '+s.dtau+'s';}
+   forcebtn.style.display=(s.rlearn||s.dlearn)?'':'none';
+   roomlbl.textContent=(s.rlearn?'measured ':'baseline ')+
+     'rise '+s.rise+'/s (baseline '+s.baserise+'/s)'+
+     (s.rlearn&&impl&&Math.abs(impl-ft)/ft>0.2
+        ?' - behaves like ~'+impl+' cu ft':'')+
+     ', decay '+s.dtau+'s'+(s.dlearn?' (measured)':'');}
   // Used of total, both for RAM and for the peak. "Free heap" needs a total to
   // mean anything, and "low water mark" is the minimum free since boot said
   // backwards - as a peak used it is the number you actually care about: the
