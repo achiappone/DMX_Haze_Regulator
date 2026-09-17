@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.19.000"
+#define FW_VERSION "1.20.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -85,6 +85,15 @@ struct {
   int riseCut = 3;       // ug/m3/s climb that latches output off; 0 = disabled
   int integralTi = 300;  // integral time, seconds; 0 = proportional only
   float riseRate = 0;    // signal units per second at 100% output, from calibration
+  // What was asked for on each control signal, kept per signal so switching
+  // between them is lossless. Converting by the measured ratio instead lost up
+  // to 8% of the target per round trip, in a random direction, because the
+  // PM1.0/PM2.5 ratio is noisy and k * (1/k) only equals 1 if both readings
+  // land on the same sensor frame. An operator picks a level once per signal;
+  // remembering it beats deriving it every time. 0 means never set.
+  float spBy[3] = {0, 0, 0};
+  float dbBy[3] = {0, 0, 0};
+  float riseBy[3] = {0, 0, 0};
   int deadTime = 0;      // seconds from commanding output to seeing it
   int dosePct = 100;     // how much of the computed deficit to commit, percent
   bool stopped = false;  // latched stop; survives reboot on purpose
@@ -769,6 +778,12 @@ void saveCfg() {
   prefs.putUChar("manual", cfg.manual);
   prefs.putInt("source", cfg.source);
   prefs.putFloat("setpoint", cfg.setpoint);
+  for (int i = 0; i < 3; i++) {
+    char k[8];
+    snprintf(k, sizeof(k), "sp%d", i);  prefs.putFloat(k, cfg.spBy[i]);
+    snprintf(k, sizeof(k), "db%d", i);  prefs.putFloat(k, cfg.dbBy[i]);
+    snprintf(k, sizeof(k), "ri%d", i);  prefs.putFloat(k, cfg.riseBy[i]);
+  }
   prefs.putFloat("deadband", cfg.deadband);
   prefs.putFloat("gain", cfg.gain);
   prefs.putInt("slew", cfg.slew);
@@ -799,6 +814,12 @@ void loadCfg() {
   cfg.manual = prefs.getUChar("manual", cfg.manual);
   cfg.source = prefs.getInt("source", cfg.source);
   cfg.setpoint = prefs.getFloat("setpoint", cfg.setpoint);
+  for (int i = 0; i < 3; i++) {
+    char k[8];
+    snprintf(k, sizeof(k), "sp%d", i);  cfg.spBy[i] = prefs.getFloat(k, 0.0f);
+    snprintf(k, sizeof(k), "db%d", i);  cfg.dbBy[i] = prefs.getFloat(k, 0.0f);
+    snprintf(k, sizeof(k), "ri%d", i);  cfg.riseBy[i] = prefs.getFloat(k, 0.0f);
+  }
   cfg.deadband = prefs.getFloat("deadband", cfg.deadband);
   cfg.gain = prefs.getFloat("gain", cfg.gain);
   cfg.slew = prefs.getInt("slew", cfg.slew);
@@ -1482,12 +1503,23 @@ void handleSet() {
       // the cap would be out by 2x until the estimator relearned it over the
       // next half hour. Both readings come from the same sensor sample, so
       // their ratio converts it exactly.
+      // Put down what this signal was holding before picking up the next.
+      int was = cfg.source;
+      cfg.spBy[was] = cfg.setpoint;
+      cfg.dbBy[was] = cfg.deadband;
+      cfg.riseBy[was] = cfg.riseRate;
+
       float before = ctrlValue();
       cfg.source = sc;
       float after = ctrlValue();
+      bool known = cfg.spBy[sc] > 0;
       bool usable = before > 1.0f && after > 1.0f;
-      if (usable && cfg.riseRate > 0)
+      if (known) {
+        // Been here before: give back exactly what was left behind.
+        cfg.riseRate = cfg.riseBy[sc];
+      } else if (usable && cfg.riseRate > 0) {
         cfg.riseRate = constrain(cfg.riseRate * (after / before), 0.0f, 500.0f);
+      }
       // A window spanning the switch would average two different units.
       adaptT0 = 0;
       // The signals share tuning constants but not magnitudes, so a switch
@@ -1500,16 +1532,26 @@ void handleSet() {
       // hardcoded default threw that choice away and made switching signals
       // cost a retune. Both readings are the same sensor sample, so the ratio
       // converts the band exactly the way it converts the rise rate.
-      if (usable) {
+      if (known) {
+        cfg.setpoint = cfg.spBy[sc];
+        cfg.deadband = cfg.dbBy[sc];
+      } else if (usable) {
+        // First visit to this signal: carry the intent across by the measured
+        // ratio, which is the best guess available, and remember it from here.
         float k = after / before;
         cfg.setpoint = constrain(cfg.setpoint * k, 0.0f, 1000.0f);
         cfg.deadband = constrain(cfg.deadband * k, 0.0f, 100.0f);
       } else {
         cfg.setpoint = sc == 1 ? 20.0f : sc == 2 ? 50.0f : 150.0f;
       }
-      logEvent("control signal -> %s, band %.0f-%.0f, rise %.1f/s",
+      cfg.spBy[sc] = cfg.setpoint;
+      cfg.dbBy[sc] = cfg.deadband;
+      cfg.riseBy[sc] = cfg.riseRate;
+      capRelax = 1.0f;  // a different signal is a different model error
+      logEvent("control signal -> %s, band %.0f-%.0f, rise %.1f/s (%s)",
                sc == 1 ? "0.3um count/100" : sc == 2 ? "PM1.0" : "PM2.5",
-               (double)targetMin(), (double)targetMax(), (double)cfg.riseRate);
+               (double)targetMin(), (double)targetMax(), (double)cfg.riseRate,
+               known ? "remembered" : "converted");
       integ = 0;
       pmFiltInit = false;
       pmCount = pmIdx = 0;
