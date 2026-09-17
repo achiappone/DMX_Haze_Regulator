@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.26.000"
+#define FW_VERSION "1.26.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -2011,6 +2011,13 @@ void setup() {
     logEvent("web ui reverted to the built-in page");
   });
   server.on("/", []() {
+    // The page carries no version in its URL and changes whenever ui.sh runs,
+    // so a browser must never keep it. With no Cache-Control, ETag or
+    // Last-Modified at all, browsers fall back to heuristic caching and were
+    // serving the old page - old title included - while the board served the
+    // new one. no-store rather than no-cache: without an ETag there is nothing
+    // to revalidate against, so a conditional request would refetch anyway.
+    server.sendHeader("Cache-Control", "no-store");
     if (!authOk()) return;
     if (uiFromFs()) {
       File f = LittleFS.open(UI_PATH, "r");
