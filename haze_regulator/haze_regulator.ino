@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.26.002"
+#define FW_VERSION "1.27.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -640,6 +640,57 @@ int baselineTau(int room, int airStatic, int tempF) {
   return (int)constrain(tau, 5.0f, 1800.0f);
 }
 
+// decayTau is the one constant nothing maintained: it cannot be measured while
+// the loop is dosing, because with a 64s dead time "output off" does not mean
+// "nothing arriving" - haze commanded a minute ago is still landing. Fitting
+// the quiet stretches naively gave 58s, 128s, 294s and 351s from one half hour.
+//
+// The fix is to wait out the dead time first. After a full dead time with no
+// output commanded and none on the wire, whatever is still arriving has
+// arrived, and what remains is the room clearing on its own. Those windows are
+// rarer but they are the real thing.
+double dcN = 0, dcSx = 0, dcSy = 0, dcSxx = 0, dcSxy = 0;
+unsigned long dcStart = 0, lastOutputAt = 0;
+
+void decayReset() {
+  dcN = dcSx = dcSy = dcSxx = dcSxy = 0;
+  dcStart = 0;
+}
+
+void decayTick(unsigned long now, float lvl, int demand, int wire) {
+  if (demand > 0 || wire > 0) {
+    lastOutputAt = now;
+    decayReset();
+    return;
+  }
+  if (!lastOutputAt || now - lastOutputAt < (unsigned long)cfg.deadTime * 1000 ||
+      lvl < 5.0f) {
+    decayReset();
+    return;
+  }
+  if (!dcStart) dcStart = now;
+  double t = (now - dcStart) / 1000.0;
+  double y = log(lvl);
+  dcN++; dcSx += t; dcSy += y; dcSxx += t * t; dcSxy += t * y;
+  if (dcN < 60 || t < 90) return;  // 90s of quiet before believing anything
+
+  double den = dcN * dcSxx - dcSx * dcSx;
+  double b = den > 0 ? (dcN * dcSxy - dcSx * dcSy) / den : 0;
+  if (b < -1e-6) {
+    double tau = -1.0 / b;
+    if (tau > 5 && tau < 1800) {
+      int was = cfg.decayTau;
+      // A quarter of each measurement, like the rise rate: this is drift, and
+      // one quiet stretch is one sample of a room that changes.
+      cfg.decayTau = (int)(cfg.decayTau + 0.25 * (tau - cfg.decayTau));
+      logEvent("decay fitted %ds over %ds of quiet air, tau %d -> %d", (int)tau,
+               (int)t, was, cfg.decayTau);
+      saveAt = now + 2000;
+    }
+  }
+  decayReset();
+}
+
 uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
   if (riseRate <= 0 || deadTime <= 0) return 100;  // uncalibrated: no opinion
   if (gap <= 0) return 0;
@@ -675,6 +726,15 @@ bool sensorSaturated() {
 // 0.3um count reads in the thousands over the same span, which is where the
 // resolution for very light haze actually lives. Scaled by 100 so one set of
 // tuning constants, ranges and calibration numbers covers both sources.
+// What each control signal reads from the current sample. Lets a baseline seed
+// every signal at once, and a ratio be taken without switching sources.
+float signalValue(int src) {
+  if (!everRead) return 0.0f;
+  if (src == 1) return data.particles_03um / 100.0f;
+  if (src == 2) return (float)data.pm10_env;
+  return (float)data.pm25_env;
+}
+
 float ctrlValue() {
   if (!everRead) return 0.0f;
   if (cfg.source == 1) return data.particles_03um / 100.0f;
@@ -1313,7 +1373,7 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
-           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"uigen\":%u,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"uigen\":%u,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,\"baserise\":%.2f,"
            // Board health. minheap rather than heap alone: free heap at the
            // moment you looked says little, the low water mark since boot says
            // whether anything ever came close.
@@ -1348,7 +1408,8 @@ void handleState() {
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
            FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, uiGen, (double)capRelax, cfg.decayTau, cfg.roomSize,
-           cfg.airMode, cfg.roomTempF, (unsigned)ESP.getFreeHeap(),
+           cfg.airMode, cfg.roomTempF, (double)baselineRise(cfg.roomSize),
+           (unsigned)ESP.getFreeHeap(),
            (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getHeapSize(),
            (unsigned)(servedReqs ? reqMsTotal / servedReqs : 0),
            (unsigned)ESP.getFreePsram(),
@@ -1763,7 +1824,17 @@ void handleSet() {
     if (server.hasArg("apply")) {
       cfg.riseRate = baselineRise(cfg.roomSize);
       cfg.decayTau = baselineTau(cfg.roomSize, cfg.airMode, cfg.roomTempF);
-      cfg.riseBy[cfg.source] = cfg.riseRate;
+      // Seed every signal, not just the one selected. riseBy is per signal, so
+      // seeding only the current one left the others holding whatever stale
+      // number they were last abandoned with - and switching to one of those
+      // started cold on a board that had just been told about the room.
+      float here = signalValue(cfg.source);
+      for (int i = 0; i < 3; i++) {
+        float there = signalValue(i);
+        cfg.riseBy[i] = (here > 1.0f && there > 1.0f)
+                            ? cfg.riseRate * (there / here)
+                            : cfg.riseRate;
+      }
       capRelax = 1.0f;
       adaptT0 = 0;
       logEvent("room baseline: %ld cu ft, %s, %dF -> rise %.1f/s, decay %ds",
@@ -2333,7 +2404,7 @@ void loop() {
       // of what the room is doing, and a window containing one of them would
       // teach it something false.
       if (!cfg.stopped && cfg.automatic && !purging() && !calibrating() &&
-          !sensorSaturated())
+          !sensorSaturated()) {
         // output, not hazeLevel(). doseCap applies riseRate to demand, and
         // pulsing makes demand and on-wire differ by about 3x - so feeding the
         // wire value estimated a constant in the wrong units and doseCap then
@@ -2341,8 +2412,11 @@ void loop() {
         // demand, and 17 is what calibration's full-power pulse measured too,
         // because during calibration pulsing is bypassed and the two are equal.
         adaptTick(now, pmFilt, output);
-      else
+        decayTick(now, pmFilt, output, hazeLevel());
+      } else {
         adaptReset(now, pmFilt);
+        decayReset();
+      }
     }
     // A pegged sensor cannot report a trend, so the regulator is flying blind
     // and any output it commands is guesswork. Clear the air instead. Not during

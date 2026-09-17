@@ -466,7 +466,15 @@ async function tick(){
   if(document.activeElement!=room)room.value=s.room;
   if(document.activeElement!=air)air.value=s.air;
   if(document.activeElement!=tempf)tempf.value=s.tempf;
-  roomlbl.textContent='rise '+s.rise+'/s, decay '+s.dtau+'s';
+  // Baseline beside learned, and what the difference implies. rise scales as
+  // 1/volume, so a learned rate below the baseline means the room behaves
+  // bigger than it was told - which is the room answering back, and worth
+  // seeing rather than silently overriding the number you typed.
+  {const ft=[1200,3600,7000][s.room]||3600;
+   const impl=s.rise>0.01?Math.round(ft*(s.baserise/s.rise)/100)*100:0;
+   roomlbl.textContent='baseline '+s.baserise+'/s, learned '+s.rise+'/s'+
+     (impl&&Math.abs(impl-ft)/ft>0.2?' - behaves like ~'+impl+' cu ft':'')+
+     ', decay '+s.dtau+'s';}
   // Used of total, both for RAM and for the peak. "Free heap" needs a total to
   // mean anything, and "low water mark" is the minimum free since boot said
   // backwards - as a peak used it is the number you actually care about: the
