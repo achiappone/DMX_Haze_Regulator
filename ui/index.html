@@ -454,12 +454,17 @@ async function tick(){
   if(document.activeElement!=air)air.value=s.air;
   if(document.activeElement!=tempf)tempf.value=s.tempf;
   roomlbl.textContent='rise '+s.rise+'/s, decay '+s.dtau+'s';
-  // Low water mark, not free-right-now: free heap at the moment you looked says
-  // little, the minimum since boot says whether anything ever came close.
+  // Used of total, both for RAM and for the peak. "Free heap" needs a total to
+  // mean anything, and "low water mark" is the minimum free since boot said
+  // backwards - as a peak used it is the number you actually care about: the
+  // closest this board has ever come to running out.
+  const used=(free,total)=>K(total-free)+' of '+K(total);
   board.innerHTML=[['uptime',ago(s.up)],['loop',s.lps+'/s'],
-    ['requests served',s.reqs],['slowest response',s.slowreq+' ms'],
-    ['heap free',K(s.heap)],['heap low water',K(s.minheap)],
-    ['psram free',K(s.psfree)+' / '+K(s.pstotal)],
+    ['requests served',s.reqs],
+    ['response avg',s.avgreq+' ms'],['response worst',s.slowreq+' ms'],
+    ['ram used',used(s.heap,s.heaptotal)],
+    ['ram peak used',used(s.minheap,s.heaptotal)],
+    ['psram used',used(s.psfree,s.pstotal)],
     ['sketch',K(s.sketch)],['ota space free',K(s.flashfree)],
     ['filesystem',K(s.fsused)+' / '+K(s.fstotal)],
     ['chip temp',s.chiptemp+' \u00b0C'],['wifi',s.rssi+' dBm'],

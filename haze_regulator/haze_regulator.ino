@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.23.000"
+#define FW_VERSION "1.23.001"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -164,6 +164,7 @@ unsigned long loopTicks = 0, healthAt = 0;
 uint32_t loopRate = 0;       // loop passes per second
 uint32_t servedReqs = 0;     // requests handleClient actually did work for
 uint32_t slowestReqMs = 0;   // worst single response since boot
+uint32_t reqMsTotal = 0;     // summed response time, for an average
 unsigned long starvedSince = 0, reassocAt = 0;
 uint8_t slowReqs = 0;  // consecutive responses that crawled
 // Calibration measures the three numbers that are properties of the room, not
@@ -1286,7 +1287,8 @@ void handleState() {
            // Board health. minheap rather than heap alone: free heap at the
            // moment you looked says little, the low water mark since boot says
            // whether anything ever came close.
-           "\"heap\":%u,\"minheap\":%u,\"psfree\":%u,\"pstotal\":%u,"
+           "\"heap\":%u,\"minheap\":%u,\"heaptotal\":%u,\"avgreq\":%u,"
+           "\"psfree\":%u,\"pstotal\":%u,"
            "\"sketch\":%u,\"flashfree\":%u,\"fsused\":%u,\"fstotal\":%u,"
            "\"chiptemp\":%.1f,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
@@ -1315,7 +1317,9 @@ void handleState() {
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
            FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax, cfg.decayTau, cfg.roomSize,
            cfg.airMode, cfg.roomTempF, (unsigned)ESP.getFreeHeap(),
-           (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram(),
+           (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getHeapSize(),
+           (unsigned)(servedReqs ? reqMsTotal / servedReqs : 0),
+           (unsigned)ESP.getFreePsram(),
            (unsigned)ESP.getPsramSize(), (unsigned)ESP.getSketchSize(),
            (unsigned)ESP.getFreeSketchSpace(),
            (unsigned)(fsOk ? LittleFS.usedBytes() : 0),
@@ -2128,6 +2132,7 @@ void loop() {
     unsigned long took = millis() - t0;
     if (took > 1) {
       servedReqs++;
+      reqMsTotal += took;
       if (took > slowestReqMs) slowestReqMs = took;
       // A healthy board serves the whole page in about 265ms. Degraded, the
       // same request took 30 seconds and returned a quarter of it. Anything
