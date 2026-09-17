@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.25.000"
+#define FW_VERSION "1.26.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -152,6 +152,12 @@ unsigned long relaxAt = 0, relaxLogged = 0;
 #define UI_BAK "/index.bak"
 File uiTmp;
 bool uiUploadOk = false;
+// Bumped whenever the served page changes. An open browser watches it and
+// reloads itself, so pushing a UI no longer means walking round telling people
+// to hit refresh - and nobody reads a stale page while wondering why the fix
+// they were promised is not there. Persisted, so a reboot does not look like
+// a new page and reload every tab on the rig.
+uint32_t uiGen = 0;
 bool uiFromFs();
 
 // Health the hardware watchdogs cannot see. All four on this chip - both timer
@@ -1307,7 +1313,7 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
-           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"uigen\":%u,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,"
            // Board health. minheap rather than heap alone: free heap at the
            // moment you looked says little, the low water mark since boot says
            // whether anything ever came close.
@@ -1341,7 +1347,7 @@ void handleState() {
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
-           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax, cfg.decayTau, cfg.roomSize,
+           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, uiGen, (double)capRelax, cfg.decayTau, cfg.roomSize,
            cfg.airMode, cfg.roomTempF, (unsigned)ESP.getFreeHeap(),
            (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getHeapSize(),
            (unsigned)(servedReqs ? reqMsTotal / servedReqs : 0),
@@ -1895,6 +1901,7 @@ void setup() {
   pkAll = prefs.getUShort("pkall", 0);
   pkAllBoot = prefs.getUInt("pkallb", 0);
   pkAllAt = prefs.getUInt("pkallat", 0);
+  uiGen = prefs.getUInt("uigen", 0);
   // After loadCfg, since it needs nothing from the config, but before the loop
   // starts so the first control tick already has it.
   restoreInteg();
@@ -1969,6 +1976,10 @@ void setup() {
                   LittleFS.remove(UI_BAK);
                   if (LittleFS.exists(UI_PATH)) LittleFS.rename(UI_PATH, UI_BAK);
                   uiUploadOk = LittleFS.rename(UI_TMP, UI_PATH);
+                  if (uiUploadOk) {
+                    uiGen++;
+                    prefs.putUInt("uigen", uiGen);
+                  }
                 }
               } else if (up.status == UPLOAD_FILE_ABORTED) {
                 if (uiTmp) uiTmp.close();
@@ -1983,6 +1994,10 @@ void setup() {
     }
     LittleFS.remove(UI_PATH);
     bool ok = LittleFS.rename(UI_BAK, UI_PATH);
+    if (ok) {
+      uiGen++;
+      prefs.putUInt("uigen", uiGen);
+    }
     server.send(200, "text/plain", ok ? "restored" : "restore failed");
     logEvent(ok ? "web ui restored from the backup copy"
                 : "web ui restore from backup failed");
@@ -1990,6 +2005,8 @@ void setup() {
   server.on("/ui/reset", []() {
     if (!authOk()) return;
     LittleFS.remove(UI_PATH);
+    uiGen++;
+    prefs.putUInt("uigen", uiGen);
     server.send(200, "text/plain", "reverted to built-in ui");
     logEvent("web ui reverted to the built-in page");
   });

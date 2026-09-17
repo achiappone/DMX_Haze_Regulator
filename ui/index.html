@@ -229,6 +229,7 @@ const SRC=[{n:'PM2.5',k:'pm',c:'#4a9'},
            {n:'0.3um count/100',k:'ctrl',c:'#dfe'},
            {n:'PM1.0',k:'pm1',c:'#79c0ff'}];
 let srcIdx=0;
+const seen={};
 let winSec=remembered('win',600),offSec=0,spanSec=0,HIST=null;
 function setWin(v){winSec=+v;remember('win',winSec);clampPan();loadHist();}
 // The slider spans whatever history exists, not a nominal week: most of a
@@ -407,6 +408,11 @@ async function tick(){
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
   pmf.textContent=s.pmf; ctrl.textContent=ug(s.ctrl);
+  // Reload when the page or the firmware underneath it changes. Only after a
+  // first sighting, so opening the page never reloads it, and a reboot does not
+  // count - uiGen is persisted precisely so it does not.
+  if(seen.gen===undefined){seen.gen=s.uigen;seen.fw=s.fw;}
+  else if(s.uigen!==seen.gen||s.fw!==seen.fw){location.reload();return;}
   if(s.fw)ver.textContent='v'+s.fw+' \u00b7 built '+s.built+(s.ui?' \u00b7 ui '+s.ui:'');
   srcIdx=s.source;
   const S=SRC[srcIdx]||SRC[0];
