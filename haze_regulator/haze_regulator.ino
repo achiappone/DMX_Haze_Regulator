@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.21.000"
+#define FW_VERSION "1.23.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -90,6 +90,10 @@ struct {
   // stability and find you have moved the leak model and the rise estimator
   // with it. Two different things that happened to start with one number.
   int decayTau = 300;
+  // Room baseline, so a new install starts from something rather than nothing.
+  int roomSize = 1;   // 0 small, 1 medium, 2 large
+  int airMode = 0;    // 0 air conditioned / cycling, 1 static
+  int roomTempF = 70;
   float riseRate = 0;    // signal units per second at 100% output, from calibration
   // What was asked for on each control signal, kept per signal so switching
   // between them is lossless. Converting by the measured ratio instead lost up
@@ -573,6 +577,38 @@ float holdLoss(float level, int tau, int deadTime) {
   return level / tau * deadTime;
 }
 
+// Starting estimates for a room nobody has calibrated. Anchored on the one rig
+// with real measurements - 3600 cubic feet, air cycling, rise 16/s, decay 89s -
+// and scaled from there rather than invented from an air-change table. A place
+// to start, not an answer: calibration measures the machine, and the rise
+// estimator keeps it honest afterwards.
+//
+// rise scales as 1/volume, which is just dilution: the same machine into twice
+// the air gives half the concentration per second.
+//
+// decayTau is the weaker half. Its anchor implies about 40 air changes an hour,
+// which no ordinary room does, so what it really captures is a plume dispersing
+// near the sensor rather than the room clearing. Scaled gently with volume and
+// tripled for a static room: directionally right, and no more than that.
+const long ROOM_FT3[3] = {1200, 3600, 7000};
+#define ROOM_REF_FT3 3600.0f
+#define RISE_REF 16.0f
+#define TAU_REF 89.0f
+
+float baselineRise(int room) {
+  return RISE_REF * ROOM_REF_FT3 / (float)ROOM_FT3[constrain(room, 0, 2)];
+}
+
+int baselineTau(int room, int airStatic, int tempF) {
+  float v = (float)ROOM_FT3[constrain(room, 0, 2)] / ROOM_REF_FT3;
+  float tau = TAU_REF * cbrtf(v);
+  if (airStatic) tau *= 3.0f;
+  // Warmer air convects, mixing and dispersing faster. Small, and linear is as
+  // much as this deserves.
+  tau *= constrain(1.0f - 0.01f * (tempF - 70), 0.7f, 1.3f);
+  return (int)constrain(tau, 5.0f, 1800.0f);
+}
+
 uint8_t doseCap(float gap, float riseRate, int deadTime, int pct) {
   if (riseRate <= 0 || deadTime <= 0) return 100;  // uncalibrated: no opinion
   if (gap <= 0) return 0;
@@ -820,6 +856,9 @@ void saveCfg() {
   prefs.putInt("risecut", cfg.riseCut);
   prefs.putInt("ti", cfg.integralTi);
   prefs.putInt("dtau", cfg.decayTau);
+  prefs.putInt("room", cfg.roomSize);
+  prefs.putInt("air", cfg.airMode);
+  prefs.putInt("tempf", cfg.roomTempF);
   prefs.putFloat("rise", cfg.riseRate);
   prefs.putInt("dead", cfg.deadTime);
   prefs.putInt("dosepct", cfg.dosePct);
@@ -858,6 +897,9 @@ void loadCfg() {
   cfg.integralTi = prefs.getInt("ti", cfg.integralTi);
   // Upgrades inherit the value the two used to share.
   cfg.decayTau = prefs.getInt("dtau", cfg.integralTi);
+  cfg.roomSize = prefs.getInt("room", cfg.roomSize);
+  cfg.airMode = prefs.getInt("air", cfg.airMode);
+  cfg.roomTempF = prefs.getInt("tempf", cfg.roomTempF);
   cfg.riseRate = prefs.getFloat("rise", cfg.riseRate);
   cfg.deadTime = prefs.getInt("dead", cfg.deadTime);
   cfg.dosePct = prefs.getInt("dosepct", cfg.dosePct);
@@ -1240,7 +1282,13 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
-           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"caprelax\":%.2f,\"dtau\":%d,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,\"caprelax\":%.2f,\"dtau\":%d,\"room\":%d,\"air\":%d,\"tempf\":%d,"
+           // Board health. minheap rather than heap alone: free heap at the
+           // moment you looked says little, the low water mark since boot says
+           // whether anything ever came close.
+           "\"heap\":%u,\"minheap\":%u,\"psfree\":%u,\"pstotal\":%u,"
+           "\"sketch\":%u,\"flashfree\":%u,\"fsused\":%u,\"fstotal\":%u,"
+           "\"chiptemp\":%.1f,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
@@ -1265,7 +1313,14 @@ void handleState() {
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
-           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax, cfg.decayTau,
+           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0, (double)capRelax, cfg.decayTau, cfg.roomSize,
+           cfg.airMode, cfg.roomTempF, (unsigned)ESP.getFreeHeap(),
+           (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram(),
+           (unsigned)ESP.getPsramSize(), (unsigned)ESP.getSketchSize(),
+           (unsigned)ESP.getFreeSketchSpace(),
+           (unsigned)(fsOk ? LittleFS.usedBytes() : 0),
+           (unsigned)(fsOk ? LittleFS.totalBytes() : 0),
+           (double)temperatureRead(),
            cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
@@ -1617,6 +1672,24 @@ void handleSet() {
   }
   if (server.hasArg("dosepct"))
     cfg.dosePct = constrain(server.arg("dosepct").toInt(), 10, 200);
+  if (server.hasArg("room") || server.hasArg("air") || server.hasArg("temp")) {
+    if (server.hasArg("room"))
+      cfg.roomSize = constrain(server.arg("room").toInt(), 0, 2);
+    if (server.hasArg("air"))
+      cfg.airMode = constrain(server.arg("air").toInt(), 0, 1);
+    if (server.hasArg("temp"))
+      cfg.roomTempF = constrain(server.arg("temp").toInt(), 32, 120);
+    if (server.hasArg("apply")) {
+      cfg.riseRate = baselineRise(cfg.roomSize);
+      cfg.decayTau = baselineTau(cfg.roomSize, cfg.airMode, cfg.roomTempF);
+      cfg.riseBy[cfg.source] = cfg.riseRate;
+      capRelax = 1.0f;
+      adaptT0 = 0;
+      logEvent("room baseline: %ld cu ft, %s, %dF -> rise %.1f/s, decay %ds",
+               ROOM_FT3[cfg.roomSize], cfg.airMode ? "static" : "air cycling",
+               cfg.roomTempF, (double)cfg.riseRate, cfg.decayTau);
+    }
+  }
   if (server.hasArg("dtau"))
     cfg.decayTau = constrain(server.arg("dtau").toInt(), 5, 1800);
   if (server.hasArg("ti"))
