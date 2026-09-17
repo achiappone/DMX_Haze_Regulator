@@ -1193,7 +1193,7 @@ void selfTest() {
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>HAZE_B_STDY - recovery</title>
+<title>HAZE B STDY - recovery</title>
 <style>body{font:15px system-ui;background:#141414;color:#eee;margin:0;padding:20px}
 h1{font-size:17px;margin:0 0 10px}
 pre{background:#1c1c1c;padding:10px;border-radius:8px;overflow:auto;font-size:12px;line-height:1.5}
