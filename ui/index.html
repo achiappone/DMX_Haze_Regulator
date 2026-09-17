@@ -13,6 +13,12 @@ box-shadow:0 2px 18px #0008}
 h1{font-size:17px;margin:0 0 12px}
 .brand{display:flex;align-items:center;gap:9px;margin:0 0 10px}
 .mark{flex:none;display:block}
+/* Two columns of facts, not a grid of cards. Cards give each number equal
+   visual weight and a lot of chrome; this is a reference table you scan. */
+#board{width:100%;border-collapse:collapse;font-size:13px;margin:2px 0 4px}
+#board td{padding:4px 8px;border-bottom:1px solid #262626}
+#board td:first-child{color:#8a8a8a;width:46%}
+#board td:last-child{color:#eee;font-variant-numeric:tabular-nums}
 .b1{font:700 19px/1 system-ui;letter-spacing:.14em;color:#eee}
 .b2{font:400 12px/1 system-ui;letter-spacing:.22em;color:#4a9;text-transform:uppercase}
 .ver{margin:18px 0 0;text-align:center;color:#666;font-size:12px}
@@ -185,7 +191,7 @@ them from there.</p>
 <input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
 </details>
 <details><summary>Board</summary>
-<div class=g id=board></div></details>
+<table id=board></table></details>
 <div class=ver id=ver></div>
 <script>
 let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
@@ -478,11 +484,12 @@ async function tick(){
     // RF, because the radio is where two outages actually lived. RSSI alone
     // read -81 while the page was serving 71 bytes a second; the PHY rate and
     // which AP it settled on are what tell a weak link from a bad association.
+    ['network',s.ssid],['ip address',s.ip],
     ['wifi signal',s.rssi+' dBm'],['wifi rate',s.phy],
     ['wifi channel',s.chan],['access point',s.bssid],
     ['tx power',s.txp+' dBm'],
     ['associated for',ago(s.assoc)],['reassociations',s.reassoc]]
-    .map(([a,b])=>'<div class=c><span>'+a+'</span><b>'+b+'</b></div>').join('');
+    .map(([a,b])=>'<tr><td>'+a+'</td><td>'+b+'</td></tr>').join('');
   apbtn.className=s.autopurge?'on':''; vpp.textContent=s.pperiod; vpm.textContent=s.pminon; vpl.textContent=s.plevel;
   pulsebtn.className=s.pulse?'on':'';
   const on=(s.pnow*s.output/100);

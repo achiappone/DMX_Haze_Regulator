@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.26.001"
+#define FW_VERSION "1.26.002"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1321,7 +1321,7 @@ void handleState() {
            "\"psfree\":%u,\"pstotal\":%u,"
            "\"sketch\":%u,\"flashfree\":%u,\"fsused\":%u,\"fstotal\":%u,"
            "\"chiptemp\":%.1f,"
-           "\"bssid\":\"%s\",\"chan\":%d,\"phy\":\"%s\",\"txp\":%.1f,"
+           "\"ssid\":\"%s\",\"ip\":\"%s\",\"bssid\":\"%s\",\"chan\":%d,\"phy\":\"%s\",\"txp\":%.1f,"
            "\"reassoc\":%u,\"assoc\":%lu,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
@@ -1356,7 +1356,9 @@ void handleState() {
            (unsigned)ESP.getFreeSketchSpace(),
            (unsigned)(fsOk ? LittleFS.usedBytes() : 0),
            (unsigned)(fsOk ? LittleFS.totalBytes() : 0),
-           (double)temperatureRead(), WiFi.BSSIDstr().c_str(), WiFi.channel(),
+           (double)temperatureRead(), WiFi.SSID().c_str(),
+           WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(),
+           WiFi.channel(),
            phyMode(), txPowerDbm(), (unsigned)reassocCount,
            (unsigned long)(assocAt ? (millis() - assocAt) / 1000 : 0),
            cfg.autoPurge ? "true" : "false",
