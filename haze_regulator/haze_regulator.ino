@@ -37,7 +37,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.14.001"
+#define FW_VERSION "1.16.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -110,6 +110,11 @@ unsigned long saveAt = 0;  // debounce NVS writes; a slider drag is many changes
 // took a CSV export and arithmetic. The board knows both numbers - it should
 // say so.
 unsigned long capSince = 0, capLogged = 0;
+#define UI_PATH "/index.html"
+#define UI_TMP "/index.new"
+File uiTmp;
+bool uiUploadOk = false;
+bool uiFromFs();
 
 // Health the hardware watchdogs cannot see. All four on this chip - both timer
 // group watchdogs, the RTC one and the super watchdog - detect stoppage: a task
@@ -298,6 +303,8 @@ void importOld(const char *path, int rec) {
   f.close();
   Serial.printf("imported %d minutes from %s\n", coarseN, path);
 }
+
+bool uiFromFs() { return fsOk && LittleFS.exists(UI_PATH); }
 
 uint16_t pmHist[SLOPE_WIN];
 int pmCount = 0, pmIdx = 0;
@@ -1122,10 +1129,10 @@ input:disabled{cursor:not-allowed}
 <div class=c><span>Haze output</span><b id=out>-</b></div>
 <div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
 <div class=c><span>DMX fan</span><b id=dmxf>-</b></div>
-<div class=c><span>trend ug/m3/s</span><b id=slope>-</b></div>
+<div class=c><span id=slopelbl>trend /s</span><b id=slope>-</b></div>
 <div class=c><span id=ctrllbl>control signal</span><b id=ctrl>-</b></div>
-<div class=c><span>smoothed</span><b id=pmf>-</b></div>
-<div class=c><span>predicted PM2.5</span><b id=pred>-</b></div>
+<div class=c><span id=pmflbl>smoothed</span><b id=pmf>-</b></div>
+<div class=c><span id=predlbl>predicted</span><b id=pred>-</b></div>
 <div class=c><span>integral %</span><b id=integ>-</b></div>
 </div>
 <div class=bar><i id=obar></i><u id=tmark></u></div>
@@ -1212,7 +1219,7 @@ input:disabled{cursor:not-allowed}
 <label>DMX start address</label>
 <input type=number id=dmxaddr value=1 min=1 max=511 onchange="post('dmxaddr',this.value)">
 </details>
-<div class=ver>v)HTML" FW_VERSION R"HTML( &middot; built )HTML" FW_BUILT R"HTML(</div>
+<div class=ver id=ver></div>
 <script>
 let touching=0,purging=false,stopped=false,s_cal=0,pulseOn=false,apOn=false;
 // Two decimals only where they carry information - a 0.75 target is a real
@@ -1243,6 +1250,14 @@ function flush(){
 function remembered(k,d){try{const v=localStorage.getItem('haze.'+k);
   return v===null?d:+v;}catch(e){return d}}
 function remember(k,v){try{localStorage.setItem('haze.'+k,v)}catch(e){}}
+// Everything the interface needs to follow the selected target, in one place:
+// the label, the history series that carries it, and the colour its card
+// already uses. Three labels used to say PM2.5 regardless, which is how a card
+// ended up reading "predicted PM2.5" while the loop regulated PM1.0.
+const SRC=[{n:'PM2.5',k:'pm',c:'#4a9'},
+           {n:'0.3um count/100',k:'ctrl',c:'#dfe'},
+           {n:'PM1.0',k:'pm1',c:'#79c0ff'}];
+let srcIdx=0;
 let winSec=remembered('win',600),offSec=0,spanSec=0,HIST=null;
 function setWin(v){winSec=+v;remember('win',winSec);clampPan();loadHist();}
 // The slider spans whatever history exists, not a nominal week: most of a
@@ -1285,7 +1300,7 @@ function draw(){
   // PM10 off the top of the plot exactly when it mattered. The peak readout
   // stays PM2.5, which is the number the loop and the operator care about.
   const hiOf=a=>a&&a.length?Math.max(...a):0;
-  const peak=hiOf(H.pm);
+  const peak=hiOf(H[(SRC[srcIdx]||SRC[0]).k]||H.pm);  // peak of what is targeted
   const top=Math.max(20,hi*1.25,peak,hiOf(H.pm1),hiOf(H.pm10))*1.08;
   // Position by real elapsed time, not by index. Spreading whatever points
   // exist across the full width made 30 minutes of data in a 24 hour window
@@ -1375,9 +1390,13 @@ function draw(){
     for(let i=0;i<n;i++){if(!a[i]){pen=false;continue}
       const y=Ypm(a[i]);pen?ctx.lineTo(X(i),y):ctx.moveTo(X(i),y);pen=true;}
     ctx.stroke();};
-  gapped(H.pm1,'#79c0ff');
-  gapped(H.pm10,'#c792ea');
-  line(H.pm,Ypm,'#4a9',2);
+  // The selected target is drawn last and thickest; the rest are context. A
+  // fixed-thick PM2.5 said "this is the number that matters" even when the loop
+  // was regulating something else entirely.
+  const S=SRC[srcIdx]||SRC[0];
+  for(const[k,col]of[['pm','#4a9'],['pm1','#79c0ff'],['pm10','#c792ea']])
+    if(k!=S.k) gapped(H[k],col);
+  line(H[S.k]||H.pm,Ypm,S.c,2.4);
   ctx.font='11px system-ui';ctx.fillStyle='#777';
   const oldest=H.t[0]/10;
   ctx.fillText('showing '+(oldest>=3600?(oldest/3600).toFixed(1)+' h':
@@ -1417,7 +1436,16 @@ async function tick(){
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
   pmf.textContent=s.pmf; ctrl.textContent=ug(s.ctrl);
-  ctrllbl.textContent=s.source==1?'0.3um count /100':s.source==2?'PM1.0 ug/m3':'PM2.5 ug/m3';
+  if(s.fw)ver.textContent='v'+s.fw+' \u00b7 built '+s.built+(s.ui?' \u00b7 ui '+s.ui:'');
+  srcIdx=s.source;
+  const S=SRC[srcIdx]||SRC[0];
+  ctrllbl.textContent='control signal - '+S.n;
+  // The smoothed value, the trend and the prediction are all computed on the
+  // control signal, so they are named after whichever one is selected.
+  pmflbl.textContent='smoothed '+S.n;
+  slopelbl.textContent='trend '+S.n+'/s';
+  predlbl.textContent='predicted '+S.n;
+  for(const[el,col]of[[ctrl,S.c],[pmf,S.c],[pred,S.c]])el.style.color=col;
   if(document.activeElement!=source)source.value=s.source;
   // Hand the device a wall clock so the event log can carry real times.
   if(!s.clock)post('epoch',Math.floor(Date.now()/1000)-new Date().getTimezoneOffset()*60);
@@ -1581,6 +1609,7 @@ void handleState() {
            "\"slope\":%.2f,\"predicted\":%.2f,\"stopped\":%s,\"cal\":%d,\"calmsg\":\"%s\",\"pulse\":%s,\"pperiod\":%d,"
            "\"calpulse\":%d,\"calleft\":%d,\"haze\":%u,\"pnow\":%d,"
            "\"pminon\":%d,\"plevel\":%d,\"lps\":%u,\"reqs\":%u,\"slowreq\":%u,"
+           "\"fw\":\"%s\",\"built\":\"%s\",\"ui\":%d,"
            "\"autopurge\":%s,\"noresp\":%s,\"sensorOk\":%s}",
            everRead ? data.pm25_env : 0, everRead ? data.pm10_env : 0,
            everRead ? data.pm100_env : 0, everRead ? data.particles_03um : 0,
@@ -1605,6 +1634,7 @@ void handleState() {
            calState, calMsg, cfg.pulseMode ? "true" : "false", cfg.pulsePeriod,
            cfg.calPulse, calLeft(), hazeLevel(), pulsePeriodNow(),
            cfg.pulseMinOn, cfg.pulseLevel, loopRate, servedReqs, slowestReqMs,
+           FW_VERSION, FW_BUILT, uiFromFs() ? 1 : 0,
            cfg.autoPurge ? "true" : "false",
            noResponse ? "true" : "false", sensorOk ? "true" : "false");
   server.send(200, "application/json", buf);
@@ -2124,8 +2154,58 @@ void setup() {
     wifiLostAt = millis();
   }
 
+  // A UI-only change - a label, a colour, a chart tweak - used to cost a 1.1MB
+  // flash, a reboot, a reset integral and a restarted adaptation window, for
+  // bytes the controller never executes. Uploading the page to the filesystem
+  // costs 20KB and nothing else. The compiled copy stays as the fallback, so a
+  // truncated or broken upload can never leave the board without an interface:
+  // delete the file and the built-in page is back.
+  server.on("/ui", HTTP_POST,
+            []() {
+              if (!authOk()) return;
+              bool ok = uiUploadOk && uiFromFs();
+              server.send(200, "text/plain", ok ? "OK" : "FAILED");
+              logEvent(ok ? "web ui replaced from upload"
+                          : "web ui upload failed, built-in page still serving");
+            },
+            []() {
+              if (!server.authenticate(WEB_USER, WEB_PASS)) return;
+              HTTPUpload &up = server.upload();
+              if (up.status == UPLOAD_FILE_START) {
+                uiUploadOk = false;
+                uiTmp = LittleFS.open(UI_TMP, "w");
+              } else if (up.status == UPLOAD_FILE_WRITE) {
+                if (uiTmp) uiTmp.write(up.buf, up.currentSize);
+              } else if (up.status == UPLOAD_FILE_END) {
+                if (uiTmp) {
+                  uiTmp.close();
+                  // Swap in only once the whole thing has arrived, so a dropped
+                  // connection leaves the previous page untouched rather than
+                  // half of the new one.
+                  LittleFS.remove(UI_PATH);
+                  uiUploadOk = LittleFS.rename(UI_TMP, UI_PATH);
+                }
+              } else if (up.status == UPLOAD_FILE_ABORTED) {
+                if (uiTmp) uiTmp.close();
+                LittleFS.remove(UI_TMP);
+              }
+            });
+  server.on("/ui/reset", []() {
+    if (!authOk()) return;
+    LittleFS.remove(UI_PATH);
+    server.send(200, "text/plain", "reverted to built-in ui");
+    logEvent("web ui reverted to the built-in page");
+  });
   server.on("/", []() {
     if (!authOk()) return;
+    if (uiFromFs()) {
+      File f = LittleFS.open(UI_PATH, "r");
+      if (f) {
+        server.streamFile(f, "text/html");
+        f.close();
+        return;
+      }
+    }
     server.send_P(200, "text/html", PAGE);
   });
   server.on("/api/state", handleState);

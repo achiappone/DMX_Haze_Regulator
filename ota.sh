@@ -106,8 +106,11 @@ echo "waiting for $HOST to come back as $VER"
 i=0
 while [ $i -lt 30 ]; do
   sleep 2
-  RUNNING=$(curl -fs --netrc --max-time 3 "http://$HOST/" 2>/dev/null \
-            | sed -n 's/.*class=ver>v\([0-9.]*\).*/\1/p') || true
+  # From the API, not by scraping the page. The page is 20KB and the version
+  # moved out of it when the UI became replaceable; /api/state is a few hundred
+  # bytes and still answers when the link is too poor to deliver the page.
+  RUNNING=$(curl -fs --netrc --max-time 5 "http://$HOST/api/state" 2>/dev/null \
+            | sed -n 's/.*"fw":"\([0-9.]*\)".*/\1/p') || true
   if [ "$RUNNING" = "$VER" ]; then
     echo "back up on $VER"
     # Only this boot's log. Grepping the whole file reports a failure that was
