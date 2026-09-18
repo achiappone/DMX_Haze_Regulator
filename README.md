@@ -163,12 +163,28 @@ expected. Burst level changes the shape, not the amount - it is a smoothness
 control, not a delivery control.
 
 `machineTail` is subtracted from every burst on the assumption the machine keeps
-emitting that long after the command drops. **It has never been measured.** Two
-attempts failed: the first because `slew` at 1%/s turns a step into a triangle,
-the second because auto-purge silently overrides manual output. At `pminon` 2s
-against a 4s tail only a third of each dose reaches the machine, so if that
-assumption is wrong the loop is throwing away two thirds of its output for
-nothing.
+emitting that long after the command drops. Two attempts to measure it directly
+failed - the first because `slew` at 1%/s turns a step into a triangle, the
+second because auto-purge silently overrides manual output - so it was settled
+by consequence instead:
+
+| | delivery | burst | cv | in band | demand |
+|---|---|---|---|---|---|
+| pminon 2s, tail 4s | 0.35 | ~2s | 0.24 | 93% | 14.3% |
+| pminon 8s, tail 4s | 0.66 | ~8s | 0.31-0.59 | 30-48% | 5-9.5% |
+| **pminon 2s, tail 1s** | **0.64** | **~2s** | **0.19** | **86%** | **6.6%** |
+
+The same delivery is reachable by lengthening the burst or by subtracting less
+tail, and the two are not equivalent: longer bursts deliver the haze in slugs
+four times larger and the level swings accordingly. Burst *level* changes shape
+and not amount; burst *duration* changes both.
+
+If the machine really coasted 4s, cutting the tail to 1s would over-command
+every burst by three seconds and the room would run high. It does not - it sits
+mid-band on 6.6% demand with the cap not binding. **The real coast is at most a
+second, and the 4s default was discarding two thirds of every dose for
+nothing.** Settings that work on this rig: `pminon` 2s, `tail` 1s, burst level
+40.
 
 ### Pulse mode
 
