@@ -151,6 +151,25 @@ fits come back anywhere from 58s to 351s. Measuring it needs minutes of a
 genuinely quiet room. This is the open weakness - two unknowns and one equation,
 with the estimator solving for `rise` given a `decayTau` that nothing maintains.
 
+### What pulse mode actually delivers
+
+    delivered = demand * pminon / (pminon + tail)
+
+Burst level does not appear in that. `pulsePeriodNow` stretches the period in
+proportion to the burst level, so a gentler burst runs correspondingly longer
+and the average is unchanged. Measured over 19 minutes each: `eff` 0.35 at burst
+60 and 0.37 at burst 40, with the peak on the wire moving 60% to 40% as
+expected. Burst level changes the shape, not the amount - it is a smoothness
+control, not a delivery control.
+
+`machineTail` is subtracted from every burst on the assumption the machine keeps
+emitting that long after the command drops. **It has never been measured.** Two
+attempts failed: the first because `slew` at 1%/s turns a step into a triangle,
+the second because auto-purge silently overrides manual output. At `pminon` 2s
+against a 4s tail only a third of each dose reaches the machine, so if that
+assumption is wrong the loop is throwing away two thirds of its output for
+nothing.
+
 ### Pulse mode
 
 Below roughly 20% demand a hazer cannot deliver a proportional trickle, so the
@@ -246,6 +265,40 @@ The PMSA003I has no purge function of its own. Its fan is either running or
 asleep, controlled by the SET pad on the breakout - not over I2C, and not
 reachable through the STEMMA QT cable, which carries only SDA, SCL, VIN, GND.
 
+### Three adaptive layers, and how each has misbehaved
+
+They run on deliberately separated timescales - the PI in seconds, cap
+relaxation in minutes, rise estimation in tens of minutes - because every time
+two of them have interacted, the result looked like a control problem and was
+not.
+
+* **The rise estimator learned from its own transients.** A higher rise tightens
+  the cap, which drops output and the level, which the next window reads as a
+  weaker machine, which widens the cap again. That oscillates at twice the
+  window length, and a 10-15 minute hunt against a 10 minute window is the
+  fingerprint. It now discards any window whose level moved more than a third of
+  its own average.
+* **The decay fitter ratcheted.** Its bias was one-directional, which is the
+  dangerous kind: a window where late arrival offsets decay fits a shallow
+  slope, a shallow slope reads as an enormous tau, and every such window pushed
+  the estimate up while none pushed it back. It walked 89s to 567s while the
+  room was visibly draining at a rate implying 160s, cutting the cap's leak term
+  from 142 to 15 and halving the dose cap. Now: two dead times of quiet, the
+  level must fall 20%, and the fit must reach r2 0.8.
+* **The cap relaxer is the backstop for both.** Capped, below band and not
+  rising can only mean the cap is too tight, whichever constant is wrong, and
+  that judgement needs no constants at all. When it sits above 1.0x for long,
+  something upstream is lying.
+
+Measured either side of the decay fix, same band, same room:
+
+| | before | after |
+|---|---|---|
+| in band | 17-53% | 70-99% |
+| cv (sd/mean) | 0.46-0.77 | 0.11-0.34 |
+| rise estimate | sliding 11.2 -> 9.1 | steady ~8.1 |
+| capRelax | up to 2.66x | 1.0x |
+
 ## Things that cost a day
 
 Recorded because each one looked like a different problem than it was.
@@ -284,6 +337,22 @@ pulse bursts blink in and out as the window scrolled, because whether a burst
 was caught depended on where the stride landed. It takes the maximum per bucket
 now, which reads high for a pulsed signal on wide windows but never hides an
 excursion.
+
+**"Did not rise" is not "did not respond."** The no-response check required the
+level to climb, so it called the machine dead whenever the room could empty
+faster than the machine filled it - which is most of the time here. Every such
+entry in a day's log re-judged as responding once compared against what doing
+nothing would have done: the room draining 115-200 per window while the machine
+held the loss to 13-97. Same block, second bug: the window re-armed with
+`pm25_env` while the comparison used `ctrlValue()`, so regulating on anything
+else compared one signal against another and fired regardless of what the
+machine did.
+
+**Three numbers had two names.** "Haze output" was the controller's demand, not
+what the machine was doing, and the on-wire percentage was in `/api/state` but
+never shown. So 8% demand beside DMX 0 looked like a fault rather than two ends
+of a duty cycle - at 15% demand with a 14s period the wire is live for about 2s
+of it. They are now Haze demand, On wire now, and DMX value.
 
 **A scrolled chart window drifts.** `off` is an age measured from now, so a
 fixed offset slides forward as time passes and a window parked over history
