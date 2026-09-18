@@ -563,7 +563,7 @@ async function tick(){
   // which is which - a single control reading STOP could mean "you are stopped"
   // or "press to stop", and those are opposite.
   startbtn.textContent=stopped?'START':'Running...';
-  stopbtn.textContent=stopped?'Stopped':'STOP';
+  stopbtn.textContent=stopped?'Stopped...':'STOP';
   stopbtn.classList.toggle('live',stopped);
   startbtn.classList.toggle('live',!stopped);
   runtog.classList.toggle('run',!stopped);
