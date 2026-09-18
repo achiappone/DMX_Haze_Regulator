@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.30.000"
+#define FW_VERSION "1.31.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -1760,6 +1760,21 @@ void handleSet() {
     cfg.automatic = server.arg("automatic").toInt();
     if (was != cfg.automatic) logEvent("mode -> %s", cfg.automatic ? "AUTO" : "MANUAL");
   }
+  // riseRate is measured per unit of demand, through whatever fraction of that
+  // demand pulse mode actually delivers - pminon/(pminon+tail). Change either
+  // and the same demand produces a different effect, so a constant measured
+  // before the change describes a path that no longer exists.
+  //
+  // Measured: pminon 2s -> 8s took delivery from 0.35 to 0.66 and the room
+  // overshot to 575 against a band topping out at 225, because doseCap was
+  // still sizing against a rise rate learned through the old two-thirds loss.
+  // The estimator would have caught up in half an hour of over-dosing. The
+  // ratio is known exactly at the moment of the change, so apply it then.
+  float deliverBefore =
+      cfg.pulseMode
+          ? cfg.pulseMinOn / (float)(cfg.pulseMinOn + cfg.machineTail)
+          : 1.0f;
+
   // manual is a uint8_t, so it does not fit the int table and is not worth
   // widening the field for.
   if (server.hasArg("manual"))
@@ -1773,6 +1788,21 @@ void handleSet() {
   // dtau goes through the table, but setting it by hand is still a claim that
   // somebody measured the room rather than guessed at it.
   if (server.hasArg("dtau")) cfg.decayLearned = true;
+
+  if ((server.hasArg("pminon") || server.hasArg("tail")) && cfg.pulseMode) {
+    float after = cfg.pulseMinOn / (float)(cfg.pulseMinOn + cfg.machineTail);
+    if (deliverBefore > 0.01f && after > 0.01f && cfg.riseRate > 0 &&
+        fabsf(after - deliverBefore) > 0.005f) {
+      float was = cfg.riseRate;
+      cfg.riseRate =
+          constrain(cfg.riseRate * (after / deliverBefore), 0.0f, 500.0f);
+      cfg.riseBy[cfg.source] = cfg.riseRate;
+      adaptT0 = 0;  // a window spanning the change averages two delivery paths
+      logEvent("delivery %.2f -> %.2f of demand, rise %.1f -> %.1f/s",
+               (double)deliverBefore, (double)after, (double)was,
+               (double)cfg.riseRate);
+    }
+  }
   if (server.hasArg("source")) {
     int sc = constrain(server.arg("source").toInt(), 0, 2);
     if (sc != cfg.source) {
