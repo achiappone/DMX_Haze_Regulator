@@ -41,7 +41,7 @@ button.on{background:#4a9;color:#000}
    the action, and on a control that cuts output to a hazer that ambiguity is
    the wrong kind. Both states are always visible and the live one is lit. */
 .seg{display:inline-flex;border:1px solid #3a3a3a;border-radius:7px;overflow:hidden}
-.seg button{background:#242424;color:#8a8a8a;border:0;border-radius:0;
+.seg button{background:#242424;color:#8a8a8a;border:0;border-radius:0;min-width:104px;
   font-weight:600;letter-spacing:.5px;padding:7px 16px}
 .seg button+button{border-left:1px solid #3a3a3a}
 .seg button.live{color:#fff}
@@ -558,6 +558,12 @@ async function tick(){
   stopped=s.stopped;
   // NB: id must not be "stop" - window.stop() already owns that name, so the
   // element never shadows it and every property access here throws.
+  // The lit half reports what is happening, the unlit half offers the action.
+  // Safe here in a way it was not on a lone button, because the lit state says
+  // which is which - a single control reading STOP could mean "you are stopped"
+  // or "press to stop", and those are opposite.
+  startbtn.textContent=stopped?'START':'Running...';
+  stopbtn.textContent=stopped?'Stopped':'STOP';
   stopbtn.classList.toggle('live',stopped);
   startbtn.classList.toggle('live',!stopped);
   runtog.classList.toggle('run',!stopped);
