@@ -52,6 +52,18 @@ button.on{background:#4a9;color:#000}
 /* STOP keeps its colour whether or not it is the live state, and dims instead.
    A stop control that turns grey reads as unavailable, which is the opposite of
    what it is: it is the one button that always works. */
+/* The glow goes on the container, not the button: .seg has overflow:hidden to
+   clip the segment corners, which would swallow an outer shadow on a child -
+   but not the container's own. Stop pulses faster than start, because the two
+   states do not deserve the same urgency. Motion is dropped entirely for anyone
+   who has asked the OS not to animate things. */
+@keyframes glowg{0%,100%{box-shadow:0 0 0 0 #2e7d5200}
+  50%{box-shadow:0 0 12px 1px #2e7d5299}}
+@keyframes glowr{0%,100%{box-shadow:0 0 0 0 #e74c3c00}
+  50%{box-shadow:0 0 15px 2px #e74c3caa}}
+#runtog.run{animation:glowg 2.8s ease-in-out infinite}
+#runtog.halt{animation:glowr 1.5s ease-in-out infinite}
+@media(prefers-reduced-motion:reduce){#runtog.run,#runtog.halt{animation:none}}
 #stopbtn{background:#c0392b;color:#fff;opacity:.4}
 #stopbtn.live{opacity:1;box-shadow:inset 0 0 0 2px #e74c3c55}
 #warn.halt{color:#e74c3c;font-weight:600}
@@ -548,6 +560,8 @@ async function tick(){
   // element never shadows it and every property access here throws.
   stopbtn.classList.toggle('live',stopped);
   startbtn.classList.toggle('live',!stopped);
+  runtog.classList.toggle('run',!stopped);
+  runtog.classList.toggle('halt',stopped);
   purging=s.purge>0;
   purge.textContent=purging?'Purging '+s.purge+'s (stop)':'Purge';
   purge.className=purging?'on':'';
