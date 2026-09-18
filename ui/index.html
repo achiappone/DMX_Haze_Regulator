@@ -107,8 +107,9 @@ input:disabled{cursor:not-allowed}
 <div class=c><span>PM10</span><b id=pm100 class=s10>-</b></div>
 <div class=c><span>fine fraction</span><b id=fine>-</b></div>
 <div class=c><span>0.3um count</span><b id=c03>-</b></div>
-<div class=c><span>Haze output</span><b id=out>-</b></div>
-<div class=c><span>DMX haze</span><b id=dmxh>-</b></div>
+<div class=c><span>Haze demand</span><b id=out>-</b></div>
+<div class=c><span>On wire now</span><b id=wire>-</b></div>
+<div class=c><span>DMX value</span><b id=dmxh>-</b></div>
 <div class=c><span>DMX fan</span><b id=dmxf>-</b></div>
 <div class=c><span id=slopelbl>trend /s</span><b id=slope>-</b></div>
 <div class=c><span id=ctrllbl>control signal</span><b id=ctrl>-</b></div>
@@ -450,6 +451,7 @@ async function tick(){
   // means what the sensor sees really is haze; a low one means coarse dust.
   fine.textContent=s.pm25?Math.round(s.pm10/s.pm25*100)+'%':'-';
   c03.textContent=s.c03; out.textContent=s.output+'%';
+  wire.textContent=s.haze+'%';
   dmxh.textContent=s.dmxhaze; dmxf.textContent=s.hasfan?s.dmxfan:'-';
   slope.textContent=(s.slope>0?'+':'')+s.slope.toFixed(2);
   pmf.textContent=s.pmf; ctrl.textContent=ug(s.ctrl);
