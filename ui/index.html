@@ -45,7 +45,10 @@ button.on{background:#4a9;color:#000}
   font-weight:600;letter-spacing:.5px;padding:7px 16px}
 .seg button+button{border-left:1px solid #3a3a3a}
 .seg button.live{color:#fff}
-#startbtn.live{background:#2e7d52}
+#startbtn.live,#autobtn.live{background:#2e7d52}
+/* Manual is not a fault, so it is lit rather than warned about - but it is a
+   state worth noticing, since the loop is not regulating in it. */
+#manbtn.live{background:#8a6d1f}
 /* STOP keeps its colour whether or not it is the live state, and dims instead.
    A stop control that turns grey reads as unavailable, which is the opposite of
    what it is: it is the one button that always works. */
@@ -113,7 +116,9 @@ input:disabled{cursor:not-allowed}
 <div class=row><div class=seg id=runtog>
 <button id=startbtn onclick="post('stop',0)">START</button>
 <button id=stopbtn onclick="post('stop',1)">STOP</button></div>
-<button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
+<div class=seg id=modetog>
+<button id=autobtn onclick="post('automatic',1)">AUTO</button>
+<button id=manbtn onclick="post('automatic',0)">MANUAL</button></div>
 <span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option></select></span>
 <span class=grp><select id=win onchange="setWin(this.value)">
@@ -458,8 +463,12 @@ async function tick(){
     (s.pkall?' (boot '+s.pkallb+', '+ago(s.pkallat)+')':''); pred.textContent=(s.leadfall||s.leadrise)?s.predicted:'off';
   obar.style.width=s.output+'%';
   tmark.style.left=s.target+'%';
-  mode.textContent=s.automatic?'AUTO':'MANUAL';
-  mode.className=s.automatic?'on':''; mode.dataset.v=s.automatic?1:0;
+  // Same reasoning as START/STOP: one button that renamed itself could be read
+  // as either the current mode or the mode it would switch to, and those are
+  // opposite meanings. Both are shown, the live one is lit, and each half posts
+  // its own value rather than inverting whatever the page last saw.
+  autobtn.classList.toggle('live',s.automatic);
+  manbtn.classList.toggle('live',!s.automatic);
   // Fade and disable whatever the current mode ignores, so a slider that does
   // nothing cannot be mistaken for one that is not working.
   manrow.classList.toggle('dim',s.automatic); manual.disabled=s.automatic;
