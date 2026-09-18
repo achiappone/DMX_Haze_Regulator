@@ -142,7 +142,7 @@ input:disabled{cursor:not-allowed}
 <button id=savebtn onclick="post('save',1);this.textContent='Saved';setTimeout(()=>{this.textContent='Save'},1500)">Save</button></div>
 <div id=manrow><label>Manual haze <span id=vman></span>%</label><input type=range id=manual min=0 max=100 oninput="post('manual',this.value)"></div>
 <div id=fanrow><label>Fan speed <span id=vfan></span>%</label><input type=range id=fan min=0 max=100 oninput="post('fan',this.value)"></div>
-<div class="c band">
+<div class="c band" id=bandcard>
 <label>Target band <span id=vsp></span></label>
 <div class=row><span class=bl>Min</span>
 <input type=number id=tgtmin min=0 max=1000 step=0.25 onchange="post('tgtmin',this.value)">
@@ -483,6 +483,10 @@ async function tick(){
   manbtn.classList.toggle('live',!s.automatic);
   // Fade and disable whatever the current mode ignores, so a slider that does
   // nothing cannot be mistaken for one that is not working.
+  // In manual the band is not a target - nothing reads it - so it is dimmed and
+  // disabled rather than sitting there looking like it still governs something.
+  bandcard.classList.toggle('dim',!s.automatic);
+  for(const e of [tgtmin,tgtmax,tgtminr,tgtmaxr])e.disabled=!s.automatic;
   manrow.classList.toggle('dim',s.automatic); manual.disabled=s.automatic;
   pprow.classList.toggle('dim',s.automatic); pperiod.disabled=s.automatic;
   pmrow.classList.toggle('dim',!s.automatic); pminon.disabled=!s.automatic;
