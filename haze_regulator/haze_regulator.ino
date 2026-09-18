@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.29.000"
+#define FW_VERSION "1.30.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -658,12 +658,14 @@ int baselineTau(int room, int airStatic, int tempF) {
 // output commanded and none on the wire, whatever is still arriving has
 // arrived, and what remains is the room clearing on its own. Those windows are
 // rarer but they are the real thing.
-double dcN = 0, dcSx = 0, dcSy = 0, dcSxx = 0, dcSxy = 0;
+double dcN = 0, dcSx = 0, dcSy = 0, dcSxx = 0, dcSxy = 0, dcSyy = 0;
+float adaptStartLvl = 0;
 unsigned long dcStart = 0, lastOutputAt = 0;
 
 void decayReset() {
-  dcN = dcSx = dcSy = dcSxx = dcSxy = 0;
+  dcN = dcSx = dcSy = dcSxx = dcSxy = dcSyy = 0;
   dcStart = 0;
+  adaptStartLvl = 0;
 }
 
 void decayTick(unsigned long now, float lvl, int demand, int wire) {
@@ -672,20 +674,43 @@ void decayTick(unsigned long now, float lvl, int demand, int wire) {
     decayReset();
     return;
   }
-  if (!lastOutputAt || now - lastOutputAt < (unsigned long)cfg.deadTime * 1000 ||
-      lvl < 5.0f) {
+  // Two dead times, not one. A dead time is the mean transport delay and
+  // arrival has a long tail behind it: with bursts every 14s there is nearly
+  // always something still landing, and a window where late arrival offsets
+  // decay fits a shallow slope, which reads as an enormous tau. That bias is
+  // one-directional, so it ratchets - this fitter walked decayTau from 89s to
+  // 567s while the room was visibly draining at a rate implying about 160s,
+  // and halved the dose cap on the way.
+  if (!lastOutputAt ||
+      now - lastOutputAt < (unsigned long)cfg.deadTime * 2000 || lvl < 5.0f) {
     decayReset();
     return;
   }
-  if (!dcStart) dcStart = now;
+  if (!dcStart) {
+    dcStart = now;
+    adaptStartLvl = lvl;
+  }
   double t = (now - dcStart) / 1000.0;
   double y = log(lvl);
-  dcN++; dcSx += t; dcSy += y; dcSxx += t * t; dcSxy += t * y;
+  dcN++; dcSx += t; dcSy += y; dcSxx += t * t; dcSxy += t * y; dcSyy += y * y;
   if (dcN < 60 || t < 90) return;  // 90s of quiet before believing anything
 
+  // A window has to show real clearing to be evidence of clearing. Without
+  // this, a level that barely moved fit a near-zero slope and produced a tau
+  // of hundreds of seconds from a room that was not doing anything.
+  if (lvl > adaptStartLvl * 0.8f) {
+    decayReset();
+    return;
+  }
   double den = dcN * dcSxx - dcSx * dcSx;
   double b = den > 0 ? (dcN * dcSxy - dcSx * dcSy) / den : 0;
-  if (b < -1e-6) {
+  // And it has to be a decay, not a wander: without a fit quality check a noisy
+  // flat window passes on the strength of one end point, which is the same
+  // mistake the two-point slope made.
+  double sst = dcSyy - dcSy * dcSy / dcN;
+  double ssr = sst - (b * (dcSxy - dcSx * dcSy / dcN));
+  double r2 = sst > 0 ? 1.0 - ssr / sst : 0;
+  if (b < -1e-6 && r2 > 0.8) {
     double tau = -1.0 / b;
     if (tau > 5 && tau < 1800) {
       int was = cfg.decayTau;
@@ -693,8 +718,9 @@ void decayTick(unsigned long now, float lvl, int demand, int wire) {
       // one quiet stretch is one sample of a room that changes.
       cfg.decayTau = (int)(cfg.decayTau + 0.25 * (tau - cfg.decayTau));
       cfg.decayLearned = true;
-      logEvent("decay fitted %ds over %ds of quiet air, tau %d -> %d", (int)tau,
-               (int)t, was, cfg.decayTau);
+      logEvent("decay fitted %ds over %ds quiet, %.0f->%.0f, r2 %.2f, tau %d -> %d",
+               (int)tau, (int)t, (double)adaptStartLvl, (double)lvl, r2, was,
+               cfg.decayTau);
       saveAt = now + 2000;
     }
   }
