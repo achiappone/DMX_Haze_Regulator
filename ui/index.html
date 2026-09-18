@@ -46,7 +46,11 @@ button.on{background:#4a9;color:#000}
 .seg button+button{border-left:1px solid #3a3a3a}
 .seg button.live{color:#fff}
 #startbtn.live{background:#2e7d52}
-#stopbtn.live{background:#c0392b;box-shadow:inset 0 0 0 2px #e74c3c55}
+/* STOP keeps its colour whether or not it is the live state, and dims instead.
+   A stop control that turns grey reads as unavailable, which is the opposite of
+   what it is: it is the one button that always works. */
+#stopbtn{background:#c0392b;color:#fff;opacity:.4}
+#stopbtn.live{opacity:1;box-shadow:inset 0 0 0 2px #e74c3c55}
 #warn.halt{color:#e74c3c;font-weight:600}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
 canvas{width:100%;height:360px;display:block;background:#1c1c1c;border-radius:8px}
