@@ -73,6 +73,7 @@ canvas{width:100%;height:360px;display:block;background:#1c1c1c;border-radius:8p
 .grp{display:inline-flex;gap:6px;align-items:center;background:#1a1a1a;
 border:1px solid #2d2d2d;border-radius:9px;padding:5px 7px}
 .grp button{background:#2e2e2e}
+.gl{color:#8a8a8a;font-size:12px;letter-spacing:.03em;white-space:nowrap}
 details{margin:12px 0;border-top:1px solid #262626;padding-top:6px}
 summary{cursor:pointer;color:#888;font-size:12px;padding:4px 0}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
@@ -131,9 +132,9 @@ input:disabled{cursor:not-allowed}
 <div class=seg id=modetog>
 <button id=autobtn onclick="post('automatic',1)">AUTO</button>
 <button id=manbtn onclick="post('automatic',0)">MANUAL</button></div>
-<span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
+<span class=grp><span class=gl>Purge for</span><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option></select></span>
-<span class=grp><select id=win onchange="setWin(this.value)">
+<span class=grp><span class=gl>Chart shows last</span><select id=win onchange="setWin(this.value)">
 <option value=30>30 seconds</option><option value=60>1 minute</option><option value=120>2 minutes</option><option value=300>5 minutes</option>
 <option value=600 selected>10 minutes</option><option value=1800>30 minutes</option>
 <option value=3600>1 hour</option><option value=7200>2 hours</option>
