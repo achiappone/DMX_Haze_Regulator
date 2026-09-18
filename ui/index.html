@@ -36,8 +36,17 @@ input[type=number],select{background:#1c1c1c;color:#eee;border:1px solid #333;bo
 input[type=number]{width:80px}select{width:auto;max-width:100%;margin-bottom:4px}
 button{background:#333;color:#eee;border:0;border-radius:6px;padding:8px 14px;font:inherit}
 button.on{background:#4a9;color:#000}
-button.stop{background:#c0392b;color:#fff;font-weight:600;letter-spacing:.5px}
-button.stop.armed{background:#e74c3c;box-shadow:0 0 0 2px #e74c3c55}
+/* A segmented toggle rather than one button that renames itself. A button
+   labelled STOP is ambiguous about whether it reports the state or performs
+   the action, and on a control that cuts output to a hazer that ambiguity is
+   the wrong kind. Both states are always visible and the live one is lit. */
+.seg{display:inline-flex;border:1px solid #3a3a3a;border-radius:7px;overflow:hidden}
+.seg button{background:#242424;color:#8a8a8a;border:0;border-radius:0;
+  font-weight:600;letter-spacing:.5px;padding:7px 16px}
+.seg button+button{border-left:1px solid #3a3a3a}
+.seg button.live{color:#fff}
+#startbtn.live{background:#2e7d52}
+#stopbtn.live{background:#c0392b;box-shadow:inset 0 0 0 2px #e74c3c55}
 #warn.halt{color:#e74c3c;font-weight:600}
 #warn{color:#e94;font-size:12px;min-height:16px;margin-bottom:8px}
 canvas{width:100%;height:360px;display:block;background:#1c1c1c;border-radius:8px}
@@ -97,7 +106,9 @@ input:disabled{cursor:not-allowed}
 <button id=livebtn onclick="pan.value=0;setPan(0)">Live</button>
 <i id=panlbl style=color:#888;font-size:12px>live</i></div>
 <div class=leg><i id=peaks></i><button id=pkclr onclick="if(confirm('Clear recorded peaks?'))fetch('/api/history?clearpeaks=1')">Clear peaks</button></div>
-<div class=row><button id=stopbtn class=stop onclick="this.classList.toggle('armed');post('stop',stopped?0:1)">STOP</button>
+<div class=row><div class=seg id=runtog>
+<button id=startbtn onclick="post('stop',0)">START</button>
+<button id=stopbtn onclick="post('stop',1)">STOP</button></div>
 <button id=mode onclick="var n=this.dataset.v==1?0:1;this.dataset.v=n;this.textContent=n?'AUTO':'MANUAL';this.className=n?'on':'';post('automatic',n)">-</button>
 <span class=grp><button id=purge onclick="this.textContent=purging?'Purge':'Purging...';post('purge',purging?0:pdur.value)">Purge</button><select id=pdur><option value=15>15s</option><option value=30>30s</option><option value=60 selected>1 min</option>
 <option value=120>2 min</option><option value=300>5 min</option></select></span>
@@ -522,8 +533,8 @@ async function tick(){
   stopped=s.stopped;
   // NB: id must not be "stop" - window.stop() already owns that name, so the
   // element never shadows it and every property access here throws.
-  stopbtn.textContent=stopped?'STOPPED - resume':'STOP';
-  stopbtn.classList.toggle('armed',stopped);
+  stopbtn.classList.toggle('live',stopped);
+  startbtn.classList.toggle('live',!stopped);
   purging=s.purge>0;
   purge.textContent=purging?'Purging '+s.purge+'s (stop)':'Purge';
   purge.className=purging?'on':'';
