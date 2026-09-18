@@ -38,7 +38,7 @@
 // constant anyone has to remember: the question this footer answers is "is the
 // board running the push I just made", and a version alone cannot answer it
 // when a flash silently fails and leaves the old binary in place.
-#define FW_VERSION "1.28.000"
+#define FW_VERSION "1.29.000"
 #define FW_BUILT __DATE__ " " __TIME__
 
 #define SAT_PM 990        // PMSA003I mass tops out near 1000
@@ -2608,18 +2608,34 @@ void loop() {
       outSince = now;
       pmAtOutStart = ctrlValue();
     } else if (now - outSince >= (unsigned long)NORESP_WIN_S * 1000) {
-      float rise = ctrlValue() - pmAtOutStart;
-      if (rise < NORESP_RISE) {
+      float moved = ctrlValue() - pmAtOutStart;
+      // Against what doing nothing would have done, not against zero. The room
+      // leaks level/decayTau the whole time: at 150 with tau 61 that is 2.4/s,
+      // so about 220 units drain across this window. Requiring an absolute rise
+      // called the machine dead whenever the room could empty faster than it
+      // filled - which is most of the time here, with the tail cancelling two
+      // thirds of every dose. A level falling more slowly than pure decay is
+      // the machine contributing, even while it loses.
+      float decayOnly =
+          cfg.decayTau > 0
+              ? pmAtOutStart * (expf(-(float)NORESP_WIN_S / cfg.decayTau) - 1.0f)
+              : 0.0f;
+      bool responding = moved > decayOnly + NORESP_RISE;
+      if (!responding) {
         if (!noResponse)
-          logEvent("NO RESPONSE: %ds at %u%% and signal moved %+.1f",
-                   NORESP_WIN_S, output, rise);
+          logEvent("NO RESPONSE: %ds at %u%%, moved %+.1f, decay alone %+.1f",
+                   NORESP_WIN_S, output, (double)moved, (double)decayOnly);
         noResponse = true;
       } else if (noResponse) {
-        logEvent("machine responding again (%+.1f)", rise);
+        logEvent("machine responding again (moved %+.1f vs decay %+.1f)",
+                 (double)moved, (double)decayOnly);
         noResponse = false;
       }
       outSince = now;
-      pmAtOutStart = data.pm25_env;
+      pmAtOutStart = ctrlValue();  // was pm25_env, which is not the signal
+                                   // being compared when regulating anything
+                                   // else - the first window after a source
+                                   // switch judged one signal against another
     }
   }
 
